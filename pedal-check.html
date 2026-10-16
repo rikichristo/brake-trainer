@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pedal Check</title>
+<style>
+  :root{
+    --void:#000; --ink:#f2f5f4; --dim:#7b8481; --dimmer:#4a5250;
+    --line:#232827; --panel:#0d0f0e; --live:#7ee0a3; --warn:#e3b45a;
+    color-scheme: dark;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;background:var(--void);color:var(--ink);
+    font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
+  body{padding:22px 26px 40px;}
+  .num{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-variant-numeric:tabular-nums;}
+  h1{font-size:22px;font-weight:600;letter-spacing:-0.02em;margin:0 0 6px;}
+  .lede{color:var(--dim);max-width:70ch;margin:0 0 18px;}
+  .bar-row{display:flex;gap:12px;align-items:center;margin-bottom:18px;flex-wrap:wrap;}
+  button{border:1px solid var(--line);background:transparent;color:var(--ink);
+    padding:9px 16px;border-radius:3px;font:inherit;font-size:14px;cursor:pointer;}
+  button:hover{border-color:#3d4442;}
+  button.primary{background:var(--live);border-color:var(--live);color:#04120a;font-weight:600;}
+  .status{color:var(--dim);font-size:13.5px;}
+  .dev{border-top:1px solid var(--line);padding-top:14px;margin-top:20px;}
+  .dev-head{display:flex;justify-content:space-between;gap:14px;align-items:baseline;flex-wrap:wrap;}
+  .dev-name{font-size:15px;}
+  .dev-meta{color:var(--dimmer);font-size:12px;}
+  .axis{display:grid;grid-template-columns:30px 1fr 62px 112px;align-items:center;
+    gap:10px;margin-top:5px;}
+  .axis-n{color:var(--dimmer);font-size:12px;}
+  .track{height:7px;background:#141817;border-radius:4px;position:relative;overflow:hidden;}
+  .span{position:absolute;top:0;height:100%;background:#243029;}
+  .dot{position:absolute;top:-2px;width:3px;height:11px;background:var(--dim);border-radius:2px;}
+  .moved .dot{background:var(--live);}
+  .moved .axis-n{color:var(--live);}
+  .val{font-size:12px;color:var(--dim);text-align:right;}
+  .range{font-size:11.5px;color:var(--dimmer);}
+  .none{color:var(--warn);margin-top:20px;max-width:70ch;}
+  textarea{width:100%;height:220px;margin-top:16px;background:var(--panel);
+    color:var(--ink);border:1px solid var(--line);border-radius:3px;padding:12px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;}
+  .hint{color:var(--dimmer);font-size:12.5px;margin-top:14px;max-width:70ch;}
+</style>
+</head>
+<body>
+
+<h1>Pedal Check</h1>
+<p class="lede">
+  Every control your browser can see, live. Press each pedal and turn the wheel
+  through its full travel — an axis turns green once it has moved. Then copy the
+  report and send it back.
+</p>
+
+<div class="bar-row">
+  <button class="primary" id="copy">Copy report</button>
+  <button id="reset">Reset ranges</button>
+  <span class="status" id="status">Waiting for a device&hellip;</span>
+</div>
+
+<div id="devices"></div>
+
+<div class="none" id="none" hidden>
+  Nothing detected yet. Browsers hide a wheel or pedal set until it sends input,
+  so press a pedal all the way down, or press a button on the wheel. Some boards
+  only appear after a <em>button</em> press rather than pedal movement — if the
+  pedals alone do nothing, try a wheel button.
+</div>
+
+<textarea id="out" readonly hidden></textarea>
+
+<p class="hint">
+  This page only reads controls. It changes nothing on the rig and sends nothing anywhere.
+</p>
+
+<script>
+(function () {
+  var seen = {};            // key -> {id, axes:[{min,max,cur,moved}], buttons, mapping}
+  var devicesEl = document.getElementById('devices');
+  var statusEl = document.getElementById('status');
+  var noneEl = document.getElementById('none');
+  var outEl = document.getElementById('out');
+
+  function key(p) { return p.index + '|' + p.id; }
+
+  function poll() {
+    var pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    var live = 0;
+    for (var i = 0; i < pads.length; i++) {
+      var p = pads[i];
+      if (!p) continue;
+      live++;
+      var k = key(p);
+      var rec = seen[k];
+      if (!rec) {
+        rec = seen[k] = {
+          index: p.index, id: p.id, mapping: p.mapping || '(none)',
+          buttons: p.buttons.length, axes: [], anyButton: false
+        };
+        for (var a = 0; a < p.axes.length; a++) {
+          rec.axes.push({ min: p.axes[a], max: p.axes[a], cur: p.axes[a], moved: false });
+        }
+      }
+      for (var a2 = 0; a2 < p.axes.length && a2 < rec.axes.length; a2++) {
+        var v = p.axes[a2], ax = rec.axes[a2];
+        ax.cur = v;
+        if (v < ax.min) ax.min = v;
+        if (v > ax.max) ax.max = v;
+        if (ax.max - ax.min > 0.15) ax.moved = true;
+      }
+      for (var b = 0; b < p.buttons.length; b++) {
+        if (p.buttons[b].pressed) rec.anyButton = true;
+      }
+    }
+    render(live);
+    requestAnimationFrame(poll);
+  }
+
+  function render(live) {
+    var keys = Object.keys(seen);
+    noneEl.hidden = keys.length > 0;
+    statusEl.textContent = keys.length
+      ? keys.length + ' device' + (keys.length === 1 ? '' : 's') + ' seen, ' + live + ' connected now'
+      : 'Waiting for a device…';
+
+    var html = '';
+    keys.forEach(function (k) {
+      var d = seen[k];
+      html += '<div class="dev"><div class="dev-head">' +
+        '<span class="dev-name">' + esc(d.id) + '</span>' +
+        '<span class="dev-meta num">index ' + d.index + ' · ' + d.axes.length +
+        ' axes · ' + d.buttons + ' buttons · mapping ' + esc(d.mapping) + '</span></div>';
+      d.axes.forEach(function (ax, i) {
+        var lo = (ax.min + 1) / 2 * 100, hi = (ax.max + 1) / 2 * 100;
+        var cur = (ax.cur + 1) / 2 * 100;
+        html += '<div class="axis' + (ax.moved ? ' moved' : '') + '">' +
+          '<span class="axis-n num">' + i + '</span>' +
+          '<div class="track">' +
+            '<div class="span" style="left:' + lo + '%;width:' + Math.max(0, hi - lo) + '%"></div>' +
+            '<div class="dot" style="left:' + cur + '%"></div>' +
+          '</div>' +
+          '<span class="val num">' + ax.cur.toFixed(3) + '</span>' +
+          '<span class="range num">' + (ax.moved
+              ? ax.min.toFixed(2) + ' → ' + ax.max.toFixed(2)
+              : 'not moved') + '</span>' +
+        '</div>';
+      });
+      html += '</div>';
+    });
+    devicesEl.innerHTML = html;
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c];
+    });
+  }
+
+  function report() {
+    var lines = ['PEDAL CHECK REPORT', new Date().toISOString(),
+                 'userAgent: ' + navigator.userAgent,
+                 'location: ' + location.href, ''];
+    var keys = Object.keys(seen);
+    if (!keys.length) {
+      lines.push('NO DEVICES SEEN AT ALL.');
+    }
+    keys.forEach(function (k) {
+      var d = seen[k];
+      lines.push('DEVICE index=' + d.index + '  "' + d.id + '"');
+      lines.push('  mapping=' + d.mapping + '  axes=' + d.axes.length +
+                 '  buttons=' + d.buttons + '  anyButtonPressed=' + d.anyButton);
+      d.axes.forEach(function (ax, i) {
+        lines.push('  axis ' + i + ': cur=' + ax.cur.toFixed(3) +
+          '  min=' + ax.min.toFixed(3) + '  max=' + ax.max.toFixed(3) +
+          '  travel=' + (ax.max - ax.min).toFixed(3) +
+          (ax.moved ? '  MOVED' : '  (not moved)'));
+      });
+      lines.push('');
+    });
+    return lines.join('\n');
+  }
+
+  document.getElementById('copy').addEventListener('click', function () {
+    var text = report();
+    outEl.hidden = false;
+    outEl.value = text;
+    outEl.select();
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        statusEl.textContent = 'Report copied to clipboard.';
+      }, function () {
+        statusEl.textContent = 'Select the text below and copy it.';
+      });
+    } else {
+      statusEl.textContent = 'Select the text below and copy it.';
+    }
+  });
+
+  document.getElementById('reset').addEventListener('click', function () {
+    seen = {};
+    outEl.hidden = true;
+  });
+
+  window.addEventListener('gamepadconnected', function () {});
+  requestAnimationFrame(poll);
+})();
+</script>
+</body>
+</html>
