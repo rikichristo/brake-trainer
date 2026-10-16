@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AssemblyName>BrakeTrainerFFB</AssemblyName>
+    <RootNamespace>BrakeTrainerFFB</RootNamespace>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <!-- One file to download and double-click: no .NET install on the rig. -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- SharpDX is unmaintained but is the stable way to reach DirectInput
+         force feedback from .NET, and DirectInput itself has not moved. -->
+    <PackageReference Include="SharpDX.DirectInput" Version="4.2.0" />
+  </ItemGroup>
+</Project>

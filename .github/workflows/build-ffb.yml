@@ -1,0 +1,23 @@
+name: Build the force feedback probe
+
+on:
+  push:
+    paths: ['ffb/**', '.github/workflows/build-ffb.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Publish
+        run: dotnet publish ffb/BrakeTrainerFFB.csproj -c Release -r win-x64 -o out
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: BrakeTrainerFFB
+          path: out/BrakeTrainerFFB.exe
+          if-no-files-found: error
