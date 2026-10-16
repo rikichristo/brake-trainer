@@ -1422,9 +1422,10 @@ function DriverSelect({ onPick }) {
 
         <p className="fine">
           A profile keeps each driver's settings, bests and run history separate,
-          and stamps every run with who drove it. It is not a password: this page
-          runs from a file on this machine, so anyone using the machine can open
-          any profile. Runs travel between rigs as files, through the logbook.
+          and stamps every run with who drove it. It is not a password — anyone
+          who can open this page can open any profile. Each rig keeps its own
+          profiles and history; runs travel between them as files, through the
+          logbook.
         </p>
       </div>
     </div>
