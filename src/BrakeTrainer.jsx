@@ -833,75 +833,267 @@ function parseIBT(buf, filename, category) {
 }
 
 /* ------------------------------------------------------------
-   CSV / JSON import — normalised to 0..1 and -1..1
+   CSV / JSON import
+
+   Real car loggers name their channels nothing like iRacing does, time
+   them in formats that are not plain numbers, and log pressures in bar
+   rather than a percentage. This reads what the file actually says
+   instead of expecting one house style, and when it cannot find a
+   channel it says which headers it did find rather than importing an
+   empty lap that silently draws nothing.
    ------------------------------------------------------------ */
-function parseTelemetry(text, filename, category = "other") {
-  let rows;
-  const t = text.trim();
-  if (t.startsWith("[") || t.startsWith("{")) {
-    const j = JSON.parse(t);
-    rows = Array.isArray(j) ? j : j.samples;
-  } else {
-    const lines = t.split(/\r?\n/).filter((l) => l.trim());
-    const delim = lines[0].includes("\t") ? "\t" : lines[0].includes(";") ? ";" : ",";
-    const head = lines[0].split(delim).map((h) => h.trim().toLowerCase().replace(/[^a-z]/g, ""));
-    rows = lines.slice(1).map((l) => {
-      const cells = l.split(delim);
-      const o = {};
-      head.forEach((h, i) => { o[h] = parseFloat(cells[i]); });
-      return o;
-    });
+
+/* Exact header names, checked first. */
+const CH_ALIASES = {
+  time: ["time", "t", "times", "timestamp", "elapsed", "sessiontime", "lapcurrentlaptime", "laptime"],
+  brake: ["brake", "brakepos", "brakepress", "brakepressure", "brakepct", "brakeposition",
+          "brk", "pbrakef", "brakefront", "brakepedal", "pbrake", "brakeforce"],
+  throttle: ["throttle", "throttlepos", "throttlepct", "throttleposition", "rpedal", "apedal",
+             "gas", "accelerator", "accel", "thr", "pedalpos", "rthrottle"],
+  steer: ["steer", "steering", "steerangle", "steeringangle", "stgangle", "steeringwheelangle",
+          "wheel", "steerpos", "astg", "steerdeg"],
+  speed: ["speed", "carspeed", "vcar", "gpsspeed", "groundspeed", "vehiclespeed", "vehspeed"],
+  dist: ["lapdistance", "lapdist", "distance", "dist", "slap", "distanceonlap", "sdistance"],
+};
+
+/* Looser fallbacks, tried only if no exact name matched. Order matters:
+   brake claims its column before throttle looks for "pedal", so a file
+   with both BrakePedal and rPedal resolves the way a human would read it. */
+const CH_KEYWORDS = {
+  brake: ["brake", "brk"],
+  throttle: ["throttle", "pedal", "gas", "accel"],
+  steer: ["steer", "stg", "wheel"],
+  time: ["time"],
+  speed: ["speed", "vcar"],
+  dist: ["dist", "lap"],
+};
+
+const normHeader = (h) =>
+  String(h).replace(/^﻿/, "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+
+function resolveColumns(headers) {
+  const taken = new Set();
+  const found = {};
+  const order = ["time", "brake", "throttle", "steer", "speed", "dist"];
+
+  for (const ch of order) {
+    let hit = -1;
+    for (const alias of CH_ALIASES[ch]) {
+      const i = headers.findIndex((h, k) => h === alias && !taken.has(k));
+      if (i >= 0) { hit = i; break; }
+    }
+    if (hit < 0) {
+      for (const key of CH_KEYWORDS[ch] ?? []) {
+        const i = headers.findIndex((h, k) => h.includes(key) && !taken.has(k));
+        if (i >= 0) { hit = i; break; }
+      }
+    }
+    if (hit >= 0) { found[ch] = hit; taken.add(hit); }
   }
-  const pick = (o, names) => { for (const nm of names) if (o[nm] !== undefined && !isNaN(o[nm])) return o[nm]; return undefined; };
-  const clean = rows.map((r) => ({
-    t: pick(r, ["time", "t", "times", "timestamp", "elapsed"]),
-    brake: pick(r, ["brake", "brakepos", "brakepressure", "brk", "brakepct"]),
-    throttle: pick(r, ["throttle", "throttlepos", "thr", "gas", "accelerator", "throttlepct"]),
-    steer: pick(r, ["steer", "steering", "steerangle", "steeringangle", "wheel", "steeringwheelangle"]),
-  })).filter((r) => r.t !== undefined && isFinite(r.t));
-  if (clean.length < 20) throw new Error("Fewer than 20 usable rows. Needs time, brake, throttle and steering columns.");
+  return found;
+}
 
-  const t0 = clean[0].t;
-  const scale = clean[clean.length - 1].t - t0 > 3000 ? 0.001 : 1; // milliseconds?
-  clean.forEach((r) => { r.t = (r.t - t0) * scale; });
+/* A time column may be a plain number, or clock-ish with colons. Two
+   fields are ambiguous — 1:30 is as readable as minutes:seconds as it is
+   seconds:hundredths — so the file decides, not a guess: whichever
+   reading implies a believable sample rate wins. */
+function parseTimeColumn(raw) {
+  const parts = raw.map((s) => String(s ?? "").trim().split(":"));
+  const depth = parts[0].length;
 
-  const maxOf = (k) => clean.reduce((m, r) => Math.max(m, Math.abs(r[k] ?? 0)), 0);
-  const bMax = maxOf("brake"), thMax = maxOf("throttle"), sMax = maxOf("steer") || 1;
-  const bDiv = bMax > 1.5 ? bMax : 1, thDiv = thMax > 1.5 ? thMax : 1;
+  if (depth === 1) {
+    const v = raw.map((s) => parseFloat(s));
+    const span = v[v.length - 1] - v[0];
+    // milliseconds, if the span is implausibly large for seconds
+    const scale = span > 3000 ? 0.001 : 1;
+    return { seconds: v.map((x) => (x - v[0]) * scale), note: scale === 1 ? "seconds" : "milliseconds" };
+  }
 
-  const dur = clean[clean.length - 1].t;
-  const n = idx(dur) + 1;
-  const brake = new Float32Array(n), throttle = new Float32Array(n), steer = new Float32Array(n);
+  const nums = parts.map((p) => p.map(Number));
+  if (nums.some((p) => p.some((x) => !isFinite(x)))) return null;
+
+  if (depth === 3) {
+    const s = nums.map((p) => p[0] * 3600 + p[1] * 60 + p[2]);
+    return { seconds: s.map((x) => x - s[0]), note: "h:mm:ss" };
+  }
+
+  if (depth === 2) {
+    const asMinSec = nums.map((p) => p[0] * 60 + p[1]);
+    const asSecHun = nums.map((p) => p[0] + p[1] / 100);
+    const rate = (arr) => {
+      const span = arr[arr.length - 1] - arr[0];
+      return span > 0 ? (arr.length - 1) / span : 0;
+    };
+    const rMin = rate(asMinSec), rSec = rate(asSecHun);
+    const sane = (r) => r >= 2 && r <= 2000;
+    // A second field above 59 cannot be seconds, so that settles it outright.
+    const over59 = nums.some((p) => p[1] > 59);
+    let pick, note;
+    if (over59) { pick = asSecHun; note = "seconds:hundredths"; }
+    else if (sane(rSec) && !sane(rMin)) { pick = asSecHun; note = "seconds:hundredths"; }
+    else if (sane(rMin) && !sane(rSec)) { pick = asMinSec; note = "minutes:seconds"; }
+    else { pick = asSecHun; note = "seconds:hundredths"; }
+    return { seconds: pick.map((x) => x - pick[0]), note };
+  }
+  return null;
+}
+
+const pct = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
+
+function parseTelemetry(text, filename, category = "other") {
+  let headers, rowsRaw;
+
+  const trimmed = text.replace(/^﻿/, "").trim();
+  if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+    const j = JSON.parse(trimmed);
+    const arr = Array.isArray(j) ? j : j.samples;
+    if (!Array.isArray(arr) || !arr.length) throw new Error("No sample rows in that JSON.");
+    headers = Object.keys(arr[0]).map(normHeader);
+    rowsRaw = arr.map((o) => Object.values(o));
+  } else {
+    const lines = trimmed.split(/\r?\n/).filter((l) => l.trim());
+    if (lines.length < 3) throw new Error("That file has no data rows.");
+    const first = lines[0];
+    const delim = first.includes("\t") ? "\t" : first.includes(";") ? ";"
+                : first.includes(",") ? "," : /\s{2,}/.test(first) ? /\s+/ : ",";
+    headers = first.split(delim).map(normHeader);
+    rowsRaw = lines.slice(1).map((l) => l.split(delim));
+  }
+
+  const col = resolveColumns(headers);
+  const shown = headers.filter(Boolean).join(", ");
+  const missing = ["brake", "throttle", "steer"].filter((c) => col[c] === undefined);
+  if (missing.length) {
+    throw new Error(
+      `Could not find ${missing.join(", ")} in that file. ` +
+      `Its columns are: ${shown}. Rename the ones that hold those channels, or send me the file.`
+    );
+  }
+  if (col.time === undefined) {
+    throw new Error(`No time column found. Its columns are: ${shown}.`);
+  }
+
+  const num = (r, c) => {
+    const v = parseFloat(String(r[c] ?? "").replace(/[^0-9eE+\-.]/g, ""));
+    return isFinite(v) ? v : NaN;
+  };
+
+  const timeStrings = rowsRaw.map((r) => r[col.time]);
+  const parsedTime = parseTimeColumn(timeStrings);
+  if (!parsedTime) throw new Error(`Could not read the time column (e.g. "${timeStrings[0]}").`);
+
+  let rows = rowsRaw.map((r, i) => ({
+    t: parsedTime.seconds[i],
+    brake: num(r, col.brake),
+    throttle: num(r, col.throttle),
+    steer: num(r, col.steer),
+    speed: col.speed !== undefined ? num(r, col.speed) : NaN,
+    dist: col.dist !== undefined ? num(r, col.dist) : NaN,
+  })).filter((r) => isFinite(r.t) && isFinite(r.brake) && isFinite(r.throttle) && isFinite(r.steer));
+
+  if (rows.length < 50) throw new Error(`Only ${rows.length} usable rows after reading the file.`);
+
+  /* A session file holds several laps, separated by the distance counter
+     dropping back to zero. Train against one lap, so take the longest
+     complete one rather than replaying an entire run. */
+  let lapNote = "whole file";
+  if (col.dist !== undefined && rows.some((r) => isFinite(r.dist))) {
+    const cuts = [0];
+    for (let i = 1; i < rows.length; i++) {
+      if (isFinite(rows[i].dist) && isFinite(rows[i - 1].dist)
+          && rows[i].dist < rows[i - 1].dist - 200) cuts.push(i);
+    }
+    cuts.push(rows.length);
+    if (cuts.length > 2) {
+      let best = null;
+      for (let k = 0; k < cuts.length - 1; k++) {
+        const seg = rows.slice(cuts[k], cuts[k + 1]);
+        if (seg.length < 50) continue;
+        const covered = Math.max(...seg.map((r) => r.dist)) - Math.min(...seg.map((r) => r.dist));
+        if (!best || seg.length > best.seg.length) best = { seg, covered };
+      }
+      if (best) {
+        rows = best.seg;
+        lapNote = `one lap of ${Math.round(best.covered)} m`;
+      }
+    }
+  }
+
+  const t0 = rows[0].t;
+  rows.forEach((r) => { r.t -= t0; });
+  const dur = rows[rows.length - 1].t;
+  if (!(dur > 2)) throw new Error("That file covers less than two seconds.");
+  const srcHz = (rows.length - 1) / dur;
+
+  /* Scaling. A logger reports throttle as a percentage that can read past
+     100, and brake as pressure in bar with no fixed ceiling, so both are
+     scaled against the lap's own working maximum: full means as hard as
+     this driver went on this lap. A high percentile rather than the
+     outright peak, so one spike does not flatten everything else. */
+  const absSorted = (k) => rows.map((r) => Math.abs(r[k])).sort((a, b) => a - b);
+  const bPeak = pct(absSorted("brake"), 0.995);
+  const thPeak = pct(absSorted("throttle"), 0.995);
+  const sPeak = pct(absSorted("steer"), 0.98) * 1.1;
+
+  const bDiv = bPeak > 1.5 ? bPeak : 1;
+  const thDiv = thPeak > 1.5 ? thPeak : 1;
+  const sDiv = sPeak > 1.5 ? sPeak : Math.max(0.5, sPeak);
+
+  const n = Math.floor(dur * HZ);
+  const brake = new Float32Array(n), throttle = new Float32Array(n);
+  const steer = new Float32Array(n), speed = new Float32Array(n), dist = new Float32Array(n);
+
   let j = 0;
   for (let i = 0; i < n; i++) {
     const tt = i / HZ;
-    while (j < clean.length - 2 && clean[j + 1].t < tt) j++;
-    const A = clean[j], B = clean[j + 1] ?? clean[j];
+    while (j < rows.length - 2 && rows[j + 1].t < tt) j++;
+    const A = rows[j], B = rows[j + 1] ?? rows[j];
     const f = B.t === A.t ? 0 : clamp((tt - A.t) / (B.t - A.t), 0, 1);
-    const lerp = (k, d) => clamp((((A[k] ?? 0) * (1 - f) + (B[k] ?? 0) * f) / d), -1, 1);
-    brake[i] = clamp(lerp("brake", bDiv), 0, 1);
-    throttle[i] = clamp(lerp("throttle", thDiv), 0, 1);
-    steer[i] = lerp("steer", sMax);
+    const mix = (k) => (A[k] ?? 0) * (1 - f) + (B[k] ?? 0) * f;
+    brake[i] = clamp(mix("brake") / bDiv, 0, 1);
+    throttle[i] = clamp(mix("throttle") / thDiv, 0, 1);
+    steer[i] = clamp(mix("steer") / sDiv, -1, 1);
+    speed[i] = isFinite(A.speed) ? mix("speed") : 0;
+    dist[i] = isFinite(A.dist) ? mix("dist") : 0;
   }
-  const label = filename.replace(/\.[^.]+$/, "");
-  const speed = new Float32Array(n), dist = new Float32Array(n);
-  for (let i = 0; i < n; i++) dist[i] = i / (n - 1);
 
-  // Imported files carry no corner names, so number the zones instead.
+  const distMax = Math.max(...dist);
+  const haveDist = distMax > 10;
+
   const zones = findZones(brake).map(([a, b], k) => {
-    let peak = 0;
-    for (let i = a; i <= b; i++) if (brake[i] > peak) peak = brake[i];
+    let peak = 0, vMin = Infinity, vIn = speed[a];
+    for (let i = a; i <= b; i++) {
+      if (brake[i] > peak) peak = brake[i];
+      if (speed[i] < vMin) vMin = speed[i];
+    }
     return {
-      n: k + 1, name: `Zone ${k + 1}`, t: a / HZ, dur: (b - a) / HZ,
-      peak, at: 0, speedIn: 0, speedMin: 0,
+      n: k + 1, name: `Zone ${k + 1}`, t: a / HZ, dur: (b - a) / HZ, peak,
+      at: haveDist ? Math.round(dist[a]) : Math.round((a / HZ) * 10),
+      speedIn: Math.round(vIn) || 0,
+      speedMin: isFinite(vMin) ? Math.round(vMin) : 0,
     };
   });
+  if (!zones.length) {
+    throw new Error(
+      "No braking zones found. The brake channel read " +
+      `${bPeak.toFixed(1)} at its peak — check that column really is the brake.`
+    );
+  }
+
+  const distNorm = new Float32Array(n);
+  if (haveDist) for (let i = 0; i < n; i++) distNorm[i] = dist[i] / distMax;
+
+  const label = filename.replace(/\.[^.]+$/, "");
+  const units = bPeak > 1.5 ? `brake scaled from 0–${Math.round(bPeak)}` : "brake already 0–1";
 
   return {
     id: `import:${label}:${Date.now()}`,
-    meta: { category, car: "Imported", track: label, config: "", driver: "",
-            lapTime: dur, hz: HZ, imported: true },
-    n, dur, brake, throttle, steer, speed, dist, zones,
+    meta: {
+      category, car: "Imported", track: label, config: "", driver: "",
+      lapTime: dur, hz: HZ, imported: true, source: filename,
+      note: `${Math.round(srcHz)} Hz, ${parsedTime.note}, ${lapNote}, ${units}`,
+    },
+    n, dur, brake, throttle, steer, speed, dist: distNorm, zones,
     markers: zones.map((z) => ({ n: z.n, name: z.name, t: z.t })),
   };
 }
@@ -1534,8 +1726,10 @@ function Garage({
             ))}
           </ul>
           <p className="fine">
-            {fullLap.meta.driver}, {fullLap.meta.car}
-            {fullLap.meta.config ? ` · ${fullLap.meta.config}` : ""}
+            {fullLap.meta.imported
+              ? `Imported · ${fullLap.meta.note ?? ""}`
+              : `${fullLap.meta.driver}, ${fullLap.meta.car}` +
+                (fullLap.meta.config ? ` · ${fullLap.meta.config}` : "")}
           </p>
           <button className="btn ghost wide" disabled={!!busy} onClick={() => fileRef.current?.click()}>Import telemetry (.ibt, CSV, JSON)</button>
           <input ref={fileRef} type="file" accept=".ibt,.csv,.txt,.json,.tsv" className="hidden"
@@ -2591,7 +2785,8 @@ function Styles() {
 .h2{font-size:13px; font-weight:500; color:var(--dim); margin:0 0 12px;}
 .lede{color:var(--dim); max-width:56ch; margin:0 0 20px;}
 .fine{color:var(--dimmer); font-size:12.5px; max-width:64ch; margin:12px 0 0;}
-.err{color:var(--bad); font-size:13px; margin-top:10px;}
+.err{color:var(--bad); font-size:13px; margin-top:10px; line-height:1.45;
+  background:#2a1512; border-left:2px solid var(--bad); padding:10px 12px; border-radius:2px;}
 
 .btn{border:1px solid var(--line); background:transparent; color:var(--text);
   padding:9px 16px; border-radius:3px; font-size:14px; cursor:pointer; font-family:inherit;
