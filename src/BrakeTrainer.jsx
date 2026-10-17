@@ -123,6 +123,66 @@ function setZoneName(lapId, i, name) {
   store.set(zoneNamesKey(lapId), custom);
 }
 
+
+/* ------------------------------------------------------------
+   Imported laps, kept
+   An imported reference is as much a part of the trainer as the ones
+   compiled in, so it survives a reload. Channels are packed to bytes,
+   the same way the built-in laps are, which keeps a lap near 30 KB
+   rather than the few hundred its raw numbers would take.
+   ------------------------------------------------------------ */
+const SAVED_LAPS_KEY = "bt:laps";
+
+const loadSavedLapRecords = () => {
+  const v = store.get(SAVED_LAPS_KEY);
+  return Array.isArray(v) ? v : [];
+};
+
+function packLap(lap) {
+  const m = lap.meta ?? {};
+  return {
+    id: lap.id, category: m.category ?? "other",
+    car: m.car ?? "Imported", track: m.track ?? lap.id, config: m.config ?? "",
+    driver: m.driver ?? "", lapTime: m.lapTime ?? lap.dur, lap: m.lap ?? null,
+    trackM: m.trackM ?? null, hz: HZ, n: lap.n, imported: true,
+    note: m.note ?? "", source: m.source ?? "",
+    brake: encodeU8(lap.brake, 0, 1),
+    throttle: encodeU8(lap.throttle, 0, 1),
+    steer: encodeU8(lap.steer, -1, 1),
+    speed: encodeU8(lap.speed ?? new Float32Array(lap.n), 0, 320),
+    dist: encodeU8(lap.dist ?? new Float32Array(lap.n), 0, 1),
+    zones: lap.zones ?? [],
+  };
+}
+
+function unpackLap(rec) {
+  return {
+    id: rec.id,
+    meta: { ...rec, imported: true },
+    n: rec.n, dur: rec.n / HZ,
+    brake: decodeU8(rec.brake, 0, 1),
+    throttle: decodeU8(rec.throttle, 0, 1),
+    steer: decodeU8(rec.steer, -1, 1),
+    speed: decodeU8(rec.speed, 0, 320),
+    dist: decodeU8(rec.dist, 0, 1),
+    zones: rec.zones ?? [],
+    markers: (rec.zones ?? []).map((z) => ({ n: z.n, name: z.name, t: z.t })),
+  };
+}
+
+/* Returns false when the browser refused the write, so the caller can say
+   so rather than letting the lap quietly vanish on the next reload. */
+function saveLapRecord(rec) {
+  const kept = loadSavedLapRecords().filter((r) => r.id !== rec.id);
+  kept.push(rec);
+  return store.set(SAVED_LAPS_KEY, kept);
+}
+
+function deleteSavedLap(id) {
+  store.set(SAVED_LAPS_KEY, loadSavedLapRecords().filter((r) => r.id !== id));
+  store.remove(`bt:zonenames:${id}`);
+}
+
 const lapsIn = (cat) => LAPS.filter((l) => l.meta.category === cat);
 const lapById = (id) => LAPS.find((l) => l.id === id) ?? LAPS[0];
 
@@ -819,7 +879,7 @@ function parseIBT(buf, filename, category) {
 
   const car = meta.car || "Unknown car";
   return {
-    id: `ibt:${filename}:${Date.now()}`,
+    id: `ibt:${filename}`,
     meta: {
       category: category || CAR_CATEGORY[car] || "other",
       car, track: meta.track || filename, config: meta.config || "",
@@ -1087,7 +1147,7 @@ function parseTelemetry(text, filename, category = "other") {
   const units = bPeak > 1.5 ? `brake scaled from 0–${Math.round(bPeak)}` : "brake already 0–1";
 
   return {
-    id: `import:${label}:${Date.now()}`,
+    id: `import:${label}`,
     meta: {
       category, car: "Imported", track: label, config: "", driver: "",
       lapTime: dur, hz: HZ, imported: true, source: filename,
@@ -1398,7 +1458,8 @@ export default function BrakeTrainer() {
   const [feel, setFeel] = useState(BLANK_FEEL);
   const [viewing, setViewing] = useState(null);
   const [keyboard, setKeyboard] = useState(false);
-  const [imported, setImported] = useState([]);
+  const [imported, setImported] = useState(() => loadSavedLapRecords().map(unpackLap));
+  const [lapWarn, setLapWarn] = useState("");
   const [result, setResult] = useState(null);
   const [bests, setBests] = useState({});
 
@@ -1464,7 +1525,22 @@ export default function BrakeTrainer() {
           best={bests[bestKey]} onFeel={() => setScreen("feel")}
           onLogbook={() => setScreen("logbook")}
           onRenameZone={(i, nm) => { setZoneName(fullLap.id, i, nm); setNameRev((v) => v + 1); }}
-          onImport={(l) => { setImported((p) => [...p, l]); setLapId(l.id); setDrillId("full"); }}
+          onImport={(l) => {
+            const kept = saveLapRecord(packLap(l));
+            setImported((p) => [...p.filter((x) => x.id !== l.id), l]);
+            setLapId(l.id);
+            setDrillId("corners");
+            setLapWarn(kept ? "" :
+              `${l.meta.track} is loaded, but this browser refused to store it — ` +
+              `it will be gone on the next reload. Delete some saved runs from the Logbook and import it again.`);
+          }}
+          lapWarn={lapWarn}
+          onDeleteLap={(id) => {
+            deleteSavedLap(id);
+            setImported((p) => p.filter((x) => x.id !== id));
+            if (lapId === id) { setLapId(LAPS[0]?.id ?? ""); setDrillId("corners"); }
+            setLapWarn("");
+          }}
           onCalibrate={() => setScreen("calibrate")}
           onStart={() => setScreen("run")}
         />
@@ -1627,11 +1703,13 @@ function DriverSelect({ onPick }) {
 /* ---------------- Garage ---------------- */
 function Garage({
   driver, onSwitchDriver, cat, setCat, all, lapId, setLapId, fullLap, drills, drillId, setDrillId, lap,
-  cal, keyboard, setKeyboard, best, onImport, onCalibrate, onFeel, onLogbook, onRenameZone, onStart,
+  cal, keyboard, setKeyboard, best, onImport, lapWarn, onDeleteLap,
+  onCalibrate, onFeel, onLogbook, onRenameZone, onStart,
 }) {
   const [pads, setPads] = useState([]);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState("");
+  const [confirmDel, setConfirmDel] = useState(null);
   const fileRef = useRef(null);
 
   useEffect(() => {
@@ -1722,6 +1800,16 @@ function Garage({
                   <span className="item-name">{lapLabel(l)}</span>
                   <span className="item-sub num">{fmtLapTime(l.meta.lapTime)}</span>
                 </button>
+                {l.meta.imported && (
+                  <button className={`x ${confirmDel === l.id ? "armed" : ""}`}
+                    title={`Remove ${lapLabel(l)}`}
+                    onClick={() => {
+                      if (confirmDel === l.id) { onDeleteLap(l.id); setConfirmDel(null); }
+                      else setConfirmDel(l.id);
+                    }}>
+                    {confirmDel === l.id ? "sure?" : "\u00d7"}
+                  </button>
+                )}
               </li>
             ))}
           </ul>
@@ -1731,6 +1819,7 @@ function Garage({
               : `${fullLap.meta.driver}, ${fullLap.meta.car}` +
                 (fullLap.meta.config ? ` · ${fullLap.meta.config}` : "")}
           </p>
+          {lapWarn && <p className="err">{lapWarn}</p>}
           <button className="btn ghost wide" disabled={!!busy} onClick={() => fileRef.current?.click()}>Import telemetry (.ibt, CSV, JSON)</button>
           <input ref={fileRef} type="file" accept=".ibt,.csv,.txt,.json,.tsv" className="hidden"
             onChange={(e) => handleFile(e.target.files?.[0])} />
@@ -2809,7 +2898,9 @@ function Styles() {
 .drivers li{display:flex; align-items:stretch; gap:6px;}
 .drivers li .item{flex:1;}
 .x{background:transparent; border:1px solid var(--line); color:var(--dimmer);
-  width:34px; border-radius:3px; cursor:pointer; font-size:16px; line-height:1; font-family:inherit;}
+  min-width:34px; padding:0 8px; border-radius:3px; cursor:pointer; font-size:16px;
+  line-height:1; font-family:inherit;}
+.x.armed{color:var(--bad); border-color:var(--bad); font-size:12px;}
 .x:hover{color:var(--bad); border-color:#3d4442;}
 .who-btn{background:transparent; border:0; color:var(--text); font:inherit; font-size:14px;
   cursor:pointer; padding:0; display:flex; flex-direction:column; align-items:flex-end; gap:1px;}
