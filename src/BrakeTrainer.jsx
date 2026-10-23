@@ -1649,6 +1649,7 @@ function DriverSelect({ onPick }) {
   return (
     <div className="signin">
       <div className="signin-inner">
+        <img src="vcaso-logo.png" alt="VCASO Performance" className="vcaso-logo" />
         <canvas ref={cvs} className="signin-trace" />
         <h1 className="wordmark">Brake Trainer</h1>
         <p className="lede">
@@ -1751,6 +1752,7 @@ function Garage({
 
   return (
     <div className="garage">
+      <img src="vcaso-logo.png" alt="VCASO Performance" className="vcaso-logo top" />
       <header className="top">
         <span className="wordmark sm">Brake Trainer</span>
         <button className="who-btn" onClick={onSwitchDriver}>
@@ -2893,6 +2895,8 @@ function Styles() {
 /* sign in */
 .signin{min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px;}
 .signin-inner{width:100%; max-width:560px;}
+.vcaso-logo{display:block;height:28px;width:auto;margin:0 auto 28px}
+.vcaso-logo.top{display:block!important;flex:none;align-self:center;width:96px!important;height:auto!important;margin:6px auto 14px}
 .signin-trace{width:100%; height:64px; display:block; margin-bottom:28px; opacity:.85;}
 .drivers{margin-bottom:12px;}
 .drivers li{display:flex; align-items:stretch; gap:6px;}
