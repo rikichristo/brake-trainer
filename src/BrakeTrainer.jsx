@@ -59,6 +59,239 @@ const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const idx = (t) => Math.round(t * HZ);
 
 /* ------------------------------------------------------------
+   THE ACCOUNT SIDE
+   Same Supabase project and the same logins as the Rodin Hub, so a
+   driver types the username and password they already have. Everything
+   here is optional by design: if the CDN script never loaded, or the rig
+   is off the internet, `cloud.ready()` is false and the app falls back
+   to the local profiles it has always had. A sim rig in a garage with no
+   connection must still be able to run a drill.
+   ------------------------------------------------------------ */
+const SUPA_URL = "https://bqvygaqvwmakbrxnllws.supabase.co";
+const SUPA_KEY = "sb_publishable_M8zD44AbCWO1rjBdWVbGJA_lfRLKvwz";
+const DRIVER_DOMAIN = "drivers.rikichristo.com";
+/* Riki's login predates the drivers domain, so it is spelled out rather
+   than guessed — exactly the alias the hub uses. */
+const HANDLE_ALIAS = { riki: "riki@rikichristo.com" };
+
+const emailFor = (raw) => {
+  const h = String(raw || "").trim().toLowerCase();
+  if (HANDLE_ALIAS[h]) return HANDLE_ALIAS[h];
+  return h.includes("@") ? h : `${h}@${DRIVER_DOMAIN}`;
+};
+const handleFrom = (email) => String(email || "").split("@")[0];
+
+let _sb = null;
+function client() {
+  if (_sb) return _sb;
+  const lib = typeof window !== "undefined" ? window.supabase : null;
+  if (!lib || !lib.createClient) return null;
+  try {
+    _sb = lib.createClient(SUPA_URL, SUPA_KEY, {
+      auth: { persistSession: true, autoRefreshToken: true },
+    });
+  } catch { return null; }
+  return _sb;
+}
+
+const cloud = {
+  ready() { return !!client(); },
+
+  async session() {
+    const sb = client(); if (!sb) return null;
+    try { const { data } = await sb.auth.getSession(); return data?.session ?? null; }
+    catch { return null; }
+  },
+
+  async signIn(handle, password) {
+    const sb = client(); if (!sb) throw new Error("offline");
+    const { data, error } = await sb.auth.signInWithPassword({
+      email: emailFor(handle), password,
+    });
+    if (error) throw error;
+    return data.session;
+  },
+
+  async signOut() { const sb = client(); if (sb) { try { await sb.auth.signOut(); } catch { /* already gone */ } } },
+
+  /* The profile says whether this driver has been let in yet, and whether
+     they want to appear on the board. */
+  async profile() {
+    const sb = client(); if (!sb) return null;
+    const { data: u } = await sb.auth.getUser();
+    if (!u?.user) return null;
+    const { data, error } = await sb.from("bt_profiles")
+      .select("id,handle,full_name,role,approved,on_leaderboard")
+      .eq("id", u.user.id).maybeSingle();
+    if (error) throw error;
+    if (data) return data;
+    /* Signed in with a hub login that has never opened the trainer. Make
+       the row, unapproved, so Riki sees them in the queue. */
+    const handle = handleFrom(u.user.email);
+    const ins = {
+      id: u.user.id, handle,
+      full_name: u.user.user_metadata?.full_name || handle,
+      role: "driver", approved: false,
+    };
+    const { data: made } = await sb.from("bt_profiles").insert(ins).select().maybeSingle();
+    return made ?? { ...ins, on_leaderboard: true };
+  },
+
+  async setOnLeaderboard(on) {
+    const sb = client(); if (!sb) return;
+    const { data: u } = await sb.auth.getUser();
+    if (!u?.user) return;
+    const { error } = await sb.from("bt_profiles")
+      .update({ on_leaderboard: !!on }).eq("id", u.user.id);
+    if (error) throw error;
+  },
+
+  async changePassword(password) {
+    const sb = client(); if (!sb) throw new Error("offline");
+    const { error } = await sb.auth.updateUser({ password });
+    if (error) throw error;
+  },
+
+  /* Anyone may ask, signed out. The table only accepts a pending row. */
+  async requestAccess({ fullName, contact, wantedHandle, note }) {
+    const sb = client(); if (!sb) throw new Error("offline");
+    const { error } = await sb.from("bt_access_requests").insert({
+      full_name: fullName, contact, wanted_handle: wantedHandle, note,
+    });
+    if (error) {
+      if (/duplicate|unique/i.test(error.message)) {
+        throw new Error("You have already asked — Riki has it. He will message you.");
+      }
+      throw error;
+    }
+  },
+
+  async pendingRequests() {
+    const sb = client(); if (!sb) return [];
+    const { data, error } = await sb.from("bt_access_requests")
+      .select("id,full_name,contact,wanted_handle,note,created_at")
+      .eq("status", "pending").order("created_at", { ascending: true });
+    if (error) throw error;
+    return data ?? [];
+  },
+
+  async callAccess(body) {
+    const sb = client(); if (!sb) throw new Error("offline");
+    const { data: s } = await sb.auth.getSession();
+    const token = s?.session?.access_token;
+    if (!token) throw new Error("Sign in again.");
+    const res = await fetch(`${SUPA_URL}/functions/v1/bt-access`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SUPA_KEY,
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(body),
+    });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(out.error || `Failed (${res.status}).`);
+    return out;
+  },
+
+  approve: (requestId, handle, fullName) =>
+    cloud.callAccess({ action: "approve", requestId, handle, fullName }),
+  decline: (requestId) => cloud.callAccess({ action: "decline", requestId }),
+  newPassword: (userId) => cloud.callAccess({ action: "reset", userId }),
+
+  async drivers() {
+    const sb = client(); if (!sb) return [];
+    const { data, error } = await sb.from("bt_profiles")
+      .select("id,handle,full_name,role,approved,on_leaderboard")
+      .order("handle");
+    if (error) throw error;
+    return data ?? [];
+  },
+
+  async setApproved(id, approved) {
+    const sb = client(); if (!sb) return;
+    const { error } = await sb.from("bt_profiles").update({ approved }).eq("id", id);
+    if (error) throw error;
+  },
+
+  /* Calibration, feel and preferences, so a driver's rig settings and
+     personal bests follow them to whatever machine they sit at. */
+  async pullSettings() {
+    const sb = client(); if (!sb) return null;
+    const { data: u } = await sb.auth.getUser();
+    if (!u?.user) return null;
+    const { data, error } = await sb.from("bt_settings")
+      .select("data").eq("user_id", u.user.id).maybeSingle();
+    if (error) throw error;
+    return data?.data ?? null;
+  },
+
+  async pushSettings(payload) {
+    const sb = client(); if (!sb) return false;
+    const { data: u } = await sb.auth.getUser();
+    if (!u?.user) return false;
+    const { error } = await sb.from("bt_settings")
+      .upsert({ user_id: u.user.id, data: payload }, { onConflict: "user_id" });
+    return !error;
+  },
+
+  async logRun({ lap, drill, result, record, mode }) {
+    const sb = client(); if (!sb) return false;
+    const { data: u } = await sb.auth.getUser();
+    if (!u?.user) return false;
+    const m = lap.meta ?? {};
+    const { error } = await sb.from("bt_runs").insert({
+      user_id: u.user.id,
+      lap_id: `${lap.id ?? ""}:${drill.id}`,
+      lap_label: `${m.car ?? ""} · ${m.track ?? ""} · ${drill.name}`,
+      category: m.category ?? "", car: m.car ?? "", track: m.track ?? "",
+      mode,
+      overall: result.overall,
+      brake: Math.round(result.channels.brake.score),
+      throttle: mode === "brake" ? null : Math.round(result.channels.throttle.score),
+      steer: mode === "brake" ? null : Math.round(result.channels.steer.score),
+      seconds: Math.round((lap.dur ?? 0) * 100) / 100,
+      clip_seconds: Math.round((result.clipSeconds ?? 0) * 100) / 100,
+      faults: result.notes.map((n) => ({ title: n.title, zone: n.zone })),
+      trace: JSON.stringify(record),
+    });
+    return !error;
+  },
+
+  async myRuns(limit = 200) {
+    const sb = client(); if (!sb) return [];
+    const { data: u } = await sb.auth.getUser();
+    if (!u?.user) return [];
+    const { data, error } = await sb.from("bt_runs")
+      .select("id,user_id,lap_id,lap_label,mode,overall,brake,throttle,steer,seconds,created_at")
+      .order("created_at", { ascending: false }).limit(limit);
+    if (error) throw error;
+    return data ?? [];
+  },
+
+  async runBody(id) {
+    const sb = client(); if (!sb) return null;
+    const { data, error } = await sb.from("bt_runs").select("trace").eq("id", id).maybeSingle();
+    if (error) throw error;
+    try { return data?.trace ? JSON.parse(data.trace) : null; } catch { return null; }
+  },
+
+  async board(lapId = null) {
+    const sb = client(); if (!sb) return [];
+    const { data, error } = await sb.rpc("bt_leaderboard", { p_lap: lapId });
+    if (error) throw error;
+    return data ?? [];
+  },
+
+  async boardOverall() {
+    const sb = client(); if (!sb) return [];
+    const { data, error } = await sb.rpc("bt_leaderboard_overall");
+    if (error) throw error;
+    return data ?? [];
+  },
+};
+
+/* ------------------------------------------------------------
    REFERENCE LAPS
    Real telemetry, logged on this rig and exported from iRacing.
    Channels arrive as base64 bytes: 0.4% of full scale, finer than
@@ -468,14 +701,21 @@ function analyse(lap, cap, opts = {}) {
      on the two channels that take no effort on a brake drill. Blending
      geometrically makes the channels multiply, so a missing one drags the
      whole score down; the floor of 1 keeps it finite. For a run that is
-     merely uneven rather than absent, the two agree within a point. */
+     merely uneven rather than absent, the two agree within a point.
+
+     Brake-only drills weight the brake alone. The other two still get
+     measured, so the numbers are there in the log, but a driver whose hands
+     are off the wheel on purpose must not be marked down for it. */
+  const weights = opts.brakeOnly ? { brake: 1 } : WEIGHT;
   const overall = Math.exp(
-    Object.keys(WEIGHT).reduce(
-      (s, k) => s + WEIGHT[k] * Math.log(Math.max(1, channels[k].score)), 0)
+    Object.keys(weights).reduce(
+      (s, k) => s + weights[k] * Math.log(Math.max(1, channels[k].score)), 0)
   );
 
   const zones = analyseZones(lap, cap);
   return { overall: Math.round(overall), channels, zones,
+           brakeOnly: !!opts.brakeOnly,
+           clipSeconds: opts.clipSeconds ?? 0,
            notes: makeNotes(channels, zones, opts) };
 }
 
@@ -622,18 +862,23 @@ function makeNotes(channels, zones, opts = {}) {
       push((z.refRel - z.drvRel) * 1.5, z.name, "Releasing too fast",
         `Your trail phase lasts ${z.drvRel.toFixed(2)} s against ${z.refRel.toFixed(2)} s. Bleed the pressure off to the apex instead of dropping it.`);
 
-    if (z.thrDelta !== null && z.thrDelta > 0.18)
-      push(z.thrDelta, z.name, "Slow to pick the throttle up",
-        `${(z.thrDelta * 1000).toFixed(0)} ms later than the reference to reach half throttle.`);
+    /* On a brake-only drill the throttle and the wheel are off the screen and
+       nobody is being asked to use them, so commenting on either would be
+       marking work that was never set. */
+    if (!opts.brakeOnly) {
+      if (z.thrDelta !== null && z.thrDelta > 0.18)
+        push(z.thrDelta, z.name, "Slow to pick the throttle up",
+          `${(z.thrDelta * 1000).toFixed(0)} ms later than the reference to reach half throttle.`);
 
-    const sd = z.drvSteer - z.refSteer;
-    if (sd > 0.15) push(sd, z.name, "Too much steering angle",
-      `Peak of ${Math.round(z.drvSteer * 100)}% against ${Math.round(z.refSteer * 100)}%. Extra lock scrubs speed and usually means you arrived too fast.`);
-    else if (sd < -0.15) push(Math.abs(sd) * 0.8, z.name, "Not enough steering angle",
-      `Peak of ${Math.round(z.drvSteer * 100)}% against ${Math.round(z.refSteer * 100)}%.`);
+      const sd = z.drvSteer - z.refSteer;
+      if (sd > 0.15) push(sd, z.name, "Too much steering angle",
+        `Peak of ${Math.round(z.drvSteer * 100)}% against ${Math.round(z.refSteer * 100)}%. Extra lock scrubs speed and usually means you arrived too fast.`);
+      else if (sd < -0.15) push(Math.abs(sd) * 0.8, z.name, "Not enough steering angle",
+        `Peak of ${Math.round(z.drvSteer * 100)}% against ${Math.round(z.refSteer * 100)}%.`);
 
-    if (z.corrections >= 3) push(0.10 + z.corrections * 0.04, z.name, "Steering corrections mid-corner",
-      `${z.corrections} changes of direction where the reference has one continuous arc. Sawing at the wheel here usually means the entry speed was wrong rather than the hands.`);
+      if (z.corrections >= 3) push(0.10 + z.corrections * 0.04, z.name, "Steering corrections mid-corner",
+        `${z.corrections} changes of direction where the reference has one continuous arc. Sawing at the wheel here usually means the entry speed was wrong rather than the hands.`);
+    }
   }
 
   /* A pedal held past full scale reads as a flat top, and every shape
@@ -1486,19 +1731,22 @@ const fmtWhen = (iso) => {
    UI
    ============================================================ */
 export default function BrakeTrainer() {
-  const [screen, setScreen] = useState("signin");
-  const [driver, setDriver] = useState(null);   // { id, name }
+  const [screen, setScreen] = useState("boot");
+  const [driver, setDriver] = useState(null);   // { id, name, cloud? }
+  const [account, setAccount] = useState(null); // bt_profiles row when signed in
   const [cat, setCat] = useState(LAPS[0]?.meta.category ?? "f4");
   const [lapId, setLapId] = useState(LAPS[0]?.id ?? "");
   const [drillId, setDrillId] = useState("corners");
   const [cal, setCal] = useState(BLANK_CAL);
   const [feel, setFeel] = useState(BLANK_FEEL);
+  const [brakeOnly, setBrakeOnly] = useState(false);
   const [viewing, setViewing] = useState(null);
   const [keyboard, setKeyboard] = useState(false);
   const [imported, setImported] = useState(() => loadSavedLapRecords().map(unpackLap));
   const [lapWarn, setLapWarn] = useState("");
   const [result, setResult] = useState(null);
   const [bests, setBests] = useState({});
+  const [syncNote, setSyncNote] = useState("");
 
   /* Calibration belongs to the rig, not the driver: the axes are wherever
      this machine's hardware puts them, whoever is sitting in it. Feel and
@@ -1508,11 +1756,71 @@ export default function BrakeTrainer() {
     if (c) setCal(c);
   }, []);
 
+  /* A session may already be live from last time — the token is kept by the
+     Supabase client, exactly as the hub does it, so a driver signs in once on
+     their own machine and not again every evening. */
   useEffect(() => {
-    if (!driver) return;
+    let gone = false;
+    (async () => {
+      if (!cloud.ready()) { if (!gone) setScreen("signin"); return; }
+      const s = await cloud.session();
+      if (gone) return;
+      if (!s) { setScreen("signin"); return; }
+      try {
+        const prof = await cloud.profile();
+        if (gone) return;
+        if (!prof) { setScreen("signin"); return; }
+        await adoptAccount(prof);
+      } catch {
+        if (!gone) setScreen("signin");
+      }
+    })();
+    return () => { gone = true; };
+  }, []);
+
+  /* Taking on a signed-in identity: the driver becomes their account, and
+     their settings come down from the server so the rig they are sitting at
+     feels like their own even if they have never used it before. */
+  const adoptAccount = useCallback(async (prof) => {
+    setAccount(prof);
+    if (!prof.approved) { setScreen("waiting"); return; }
+    const who = { id: prof.id, name: prof.full_name || prof.handle, cloud: true };
+    setDriver(who);
+    let remote = null;
+    try { remote = await cloud.pullSettings(); } catch { /* use what is local */ }
+    const localFeel = store.get(`bt:feel:${prof.id}`) ?? {};
+    const localBests = store.get(`bt:bests:${prof.id}`) ?? {};
+    setFeel({ ...BLANK_FEEL, ...localFeel, ...(remote?.feel ?? {}) });
+    setBests({ ...localBests, ...(remote?.bests ?? {}) });
+    setBrakeOnly(!!(remote?.brakeOnly ?? store.get(`bt:brakeOnly:${prof.id}`)));
+    /* Calibration only travels if this machine has none of its own; the axes
+       on someone else's rig are not the axes on this one. */
+    if (remote?.cal && !store.get("bt:cal")) setCal(remote.cal);
+    setScreen("garage");
+  }, []);
+
+  useEffect(() => {
+    if (!driver || driver.cloud) return;   // cloud profiles load above
     setFeel({ ...BLANK_FEEL, ...(store.get(`bt:feel:${driver.id}`) ?? {}) });
     setBests(store.get(`bt:bests:${driver.id}`) ?? {});
+    setBrakeOnly(!!store.get(`bt:brakeOnly:${driver.id}`));
   }, [driver]);
+
+  /* One place that writes a driver's state to both sides. Local first, since
+     it must work with no connection; the server is best-effort on top. */
+  const persist = useCallback((patch) => {
+    if (!driver) return;
+    if (patch.feel !== undefined) store.set(`bt:feel:${driver.id}`, patch.feel);
+    if (patch.bests !== undefined) store.set(`bt:bests:${driver.id}`, patch.bests);
+    if (patch.brakeOnly !== undefined) store.set(`bt:brakeOnly:${driver.id}`, patch.brakeOnly);
+    if (!driver.cloud || !cloud.ready()) return;
+    cloud.pushSettings({
+      feel: patch.feel ?? feel,
+      bests: patch.bests ?? bests,
+      brakeOnly: patch.brakeOnly ?? brakeOnly,
+      cal: patch.cal ?? cal,
+    }).catch(() => setSyncNote("Your settings are saved on this machine but did not reach the server."));
+  }, [driver, feel, bests, brakeOnly, cal]);
 
   const all = useMemo(() => [...LAPS, ...imported], [imported]);
   const [nameRev, setNameRev] = useState(0);   // bump to re-read custom names
@@ -1523,11 +1831,16 @@ export default function BrakeTrainer() {
   const drills = useMemo(() => makeDrills(fullLap), [fullLap]);
   const drill = drills.find((d) => d.id === drillId) ?? drills[0];
   const lap = useMemo(() => buildDrill(fullLap, drill), [fullLap, drill]);
-  const bestKey = `${fullLap.id}:${drill.id}`;
-  const label = `${fullLap.meta.car} · ${fullLap.meta.track} · ${drill.name}`;
+
+  /* A brake-only run is a different drill from the same reference, so its
+     scores must not be compared with a full run's. The best is keyed by mode
+     too, and so is the leaderboard row. */
+  const bestKey = `${fullLap.id}:${drill.id}${brakeOnly ? ":brake" : ""}`;
+  const label = `${fullLap.meta.car} · ${fullLap.meta.track} · ${drill.name}`
+    + (brakeOnly ? " · brake only" : "");
 
   const finish = useCallback(async (cap, clipSeconds = 0) => {
-    const r = analyse(lap, cap, { clipSeconds });
+    const r = analyse(lap, cap, { clipSeconds, brakeOnly });
     // Snapshot the capture: the buffers are reused on the next run.
     const frozen = {
       brake: Float32Array.from(cap.brake),
@@ -1535,27 +1848,83 @@ export default function BrakeTrainer() {
       steer: Float32Array.from(cap.steer),
     };
     const rec = runRecord({ driver, lap, drill, result: r, cap: frozen, feel });
+    rec.brakeOnly = brakeOnly;
     const kept = saveRun(rec);
     setResult({ ...r, lap, cap: frozen, label, saved: rec, kept });
     if (!bests[bestKey] || r.overall > bests[bestKey]) {
       const nb = { ...bests, [bestKey]: r.overall };
-      setBests(nb); store.set(`bt:bests:${driver.id}`, nb);
+      setBests(nb);
+      persist({ bests: nb });
+    }
+    /* The log on the server is what makes a run visible to Riki and what
+       feeds the board. It is deliberately not awaited into the UI: a dropped
+       connection must not lose the driver their result, which is already
+       saved on this machine. */
+    if (driver?.cloud && cloud.ready()) {
+      const mode = brakeOnly ? "brake" : "full";
+      cloud.logRun({ lap: fullLap, drill, result: r, record: rec, mode })
+        .then((ok) => { if (!ok) setSyncNote("This run is saved here but did not reach the server."); })
+        .catch(() => setSyncNote("This run is saved here but did not reach the server."));
     }
     setScreen("results");
-  }, [lap, label, bests, bestKey, driver, drill, feel]);
+  }, [lap, fullLap, label, bests, bestKey, driver, drill, feel, brakeOnly, persist]);
 
-  const saveCal = (c) => { setCal(c); store.set("bt:cal", c); };
-  const saveFeel = (f) => { setFeel(f); if (driver) store.set(`bt:feel:${driver.id}`, f); };
+  const saveCal = (c) => { setCal(c); store.set("bt:cal", c); persist({ cal: c }); };
+  const saveFeel = (f) => { setFeel(f); persist({ feel: f }); };
+  const saveBrakeOnly = (v) => { setBrakeOnly(v); persist({ brakeOnly: v }); };
+
+  const leaveAccount = useCallback(async () => {
+    await cloud.signOut();
+    setAccount(null); setDriver(null); setResult(null); setSyncNote("");
+    setScreen("signin");
+  }, []);
 
   return (
     <div className="bt-root">
       <Styles />
+      {screen === "boot" && (
+        <div className="login"><p className="muted">Loading…</p></div>
+      )}
       {screen === "signin" && (
-        <DriverSelect onPick={(d) => { setDriver(d); setScreen("garage"); }} />
+        <SignIn onSignedIn={adoptAccount} onLocal={() => setScreen("local")} />
+      )}
+      {screen === "local" && (
+        <DriverSelect onPick={(d) => { setDriver(d); setScreen("garage"); }}
+          onBack={cloud.ready() ? () => setScreen("signin") : null} />
+      )}
+      {screen === "waiting" && account && (
+        <Waiting account={account} onSignOut={leaveAccount}
+          onRecheck={async () => {
+            try { const p = await cloud.profile(); if (p) await adoptAccount(p); } catch { /* stay put */ }
+          }} />
+      )}
+      {screen === "account" && (
+        <Account account={account}
+          onLeaderboard={async (on) => {
+            setAccount((a) => ({ ...a, on_leaderboard: on }));
+            try { await cloud.setOnLeaderboard(on); }
+            catch {
+              setSyncNote("Could not change that just now.");
+              setAccount((a) => ({ ...a, on_leaderboard: !on }));
+            }
+          }}
+          onSignOut={leaveAccount} onBack={() => setScreen("garage")} />
+      )}
+      {screen === "requests" && <Requests onBack={() => setScreen("garage")} />}
+      {screen === "board" && (
+        <Leaderboard lapKey={`${fullLap.id}:${drill.id}`} lapLabel={label}
+          onBack={() => setScreen("garage")} />
       )}
       {screen === "garage" && (
         <Garage
-          driver={driver} onSwitchDriver={() => { setDriver(null); setScreen("signin"); }} cat={cat} setCat={setCat}
+          driver={driver} account={account} syncNote={syncNote}
+          brakeOnly={brakeOnly} setBrakeOnly={saveBrakeOnly}
+          onAccount={driver?.cloud ? () => setScreen("account") : null}
+          onRequests={account?.role === "coach" ? () => setScreen("requests") : null}
+          onBoard={driver?.cloud ? () => setScreen("board") : null}
+          onSwitchDriver={driver?.cloud ? leaveAccount
+            : () => { setDriver(null); setScreen(cloud.ready() ? "signin" : "local"); }}
+          cat={cat} setCat={setCat}
           all={all} lapId={fullLap.id} setLapId={setLapId} fullLap={fullLap}
           drills={drills} drillId={drill.id} setDrillId={setDrillId} lap={lap}
           cal={cal} keyboard={keyboard} setKeyboard={setKeyboard}
@@ -1599,12 +1968,564 @@ export default function BrakeTrainer() {
       )}
       {screen === "run" && (
         <Run lap={lap} cal={cal} keyboard={keyboard} feel={feel} label={label}
+          brakeOnly={brakeOnly}
           onFinish={finish} onAbort={() => setScreen("garage")} />
       )}
       {screen === "results" && result && (
         <Results r={result} best={bests[bestKey]} saved={result.saved}
           onRetry={() => setScreen("run")} onGarage={() => setScreen("garage")} />
       )}
+    </div>
+  );
+}
+
+/* ---------------- Sign in ----------------
+   The same front door as the Rodin Hub, on purpose: same project, same
+   accounts, same wording. A driver who already has a hub login types the
+   username and password they already know and it simply works. */
+function SignIn({ onSignedIn, onLocal }) {
+  const [handle, setHandle] = useState("");
+  const [pass, setPass] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [asking, setAsking] = useState(false);
+
+  const offline = !cloud.ready();
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!handle.trim() || !pass) return;
+    setBusy(true); setErr("");
+    try {
+      await cloud.signIn(handle, pass);
+      const prof = await cloud.profile();
+      if (!prof) throw new Error("Signed in, but your profile would not load. Try again.");
+      await onSignedIn(prof);
+    } catch (e2) {
+      const m = String(e2?.message || e2);
+      setErr(/invalid login|credentials/i.test(m)
+        ? "That username or password didn't match. Try again."
+        : m);
+      setBusy(false);
+    }
+  };
+
+  if (asking) return <RequestAccess onBack={() => setAsking(false)} />;
+
+  return (
+    <div className="signin">
+      <div className="signin-inner narrow">
+        <img src={VCASO_LOGO} alt="VCASO Performance" className="vcaso-logo" />
+        <h1 className="h1 centre">Brake Trainer</h1>
+        <p className="lede centre">
+          {offline
+            ? "This machine is offline, so signing in is unavailable. You can still train with a local profile."
+            : "Sign in with the username and password Riki gave you."}
+        </p>
+
+        {!offline && (
+          <form onSubmit={submit} className="card-form">
+            <label className="lbl">Username
+              <input className="field" type="text" value={handle} autoComplete="username"
+                autoCapitalize="none" autoCorrect="off" spellCheck="false"
+                placeholder="e.g. reza" onChange={(e) => setHandle(e.target.value)} required />
+            </label>
+            <label className="lbl">Password
+              <input className="field" type="password" value={pass} autoComplete="current-password"
+                onChange={(e) => setPass(e.target.value)} required />
+            </label>
+            {err && <div className="err">{err}</div>}
+            <button className="btn primary wide" type="submit" disabled={busy}>
+              {busy ? "Signing in…" : "Sign in"}
+            </button>
+          </form>
+        )}
+
+        <div className="signin-alt">
+          {!offline && (
+            <button className="link" onClick={() => setAsking(true)}>
+              No login yet? Ask Riki for access
+            </button>
+          )}
+          <button className="link" onClick={onLocal}>
+            Train on this device without an account
+          </button>
+        </div>
+        <p className="fine centre">
+          Forgotten your password? Message Riki and he will send you a new one.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* Anyone may ask. The row lands in Riki's queue unapproved, and he sends a
+   password back himself — nothing here can grant its own access. */
+function RequestAccess({ onBack }) {
+  const [f, setF] = useState({ fullName: "", contact: "", wantedHandle: "", note: "" });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [sent, setSent] = useState(false);
+  const set = (k) => (e) => setF((p) => ({ ...p, [k]: e.target.value }));
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!f.fullName.trim()) return;
+    setBusy(true); setErr("");
+    try {
+      await cloud.requestAccess({
+        fullName: f.fullName.trim(),
+        contact: f.contact.trim(),
+        wantedHandle: f.wantedHandle.trim().toLowerCase(),
+        note: f.note.trim(),
+      });
+      setSent(true);
+    } catch (e2) { setErr(String(e2?.message || e2)); setBusy(false); }
+  };
+
+  if (sent) {
+    return (
+      <div className="signin">
+        <div className="signin-inner narrow">
+          <img src={VCASO_LOGO} alt="VCASO Performance" className="vcaso-logo" />
+          <h1 className="h1 centre">Asked</h1>
+          <p className="lede centre">
+            Riki has your name. When he approves you he will message you a username
+            and a password, and you sign in here with those.
+          </p>
+          <button className="btn wide" onClick={onBack}>Back to sign in</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="signin">
+      <div className="signin-inner narrow">
+        <img src={VCASO_LOGO} alt="VCASO Performance" className="vcaso-logo" />
+        <h1 className="h1 centre">Ask for access</h1>
+        <p className="lede centre">
+          Riki approves drivers one at a time. Leave your name and how to reach you.
+        </p>
+        <form onSubmit={submit} className="card-form">
+          <label className="lbl">Your name
+            <input className="field" value={f.fullName} onChange={set("fullName")}
+              placeholder="First and last name" required maxLength={80} />
+          </label>
+          <label className="lbl">How should Riki reach you?
+            <input className="field" value={f.contact} onChange={set("contact")}
+              placeholder="Discord handle, email or phone" maxLength={160} />
+          </label>
+          <label className="lbl">Username you would like <span className="hint">optional</span>
+            <input className="field" value={f.wantedHandle} onChange={set("wantedHandle")}
+              placeholder="e.g. reza" autoCapitalize="none" spellCheck="false" maxLength={40} />
+          </label>
+          <label className="lbl">Anything else <span className="hint">optional</span>
+            <textarea className="field" rows={3} value={f.note} onChange={set("note")}
+              placeholder="Which series you race, what you want to work on" maxLength={500} />
+          </label>
+          {err && <div className="err">{err}</div>}
+          <button className="btn primary wide" type="submit" disabled={busy}>
+            {busy ? "Sending…" : "Send the request"}
+          </button>
+        </form>
+        <div className="signin-alt">
+          <button className="link" onClick={onBack}>Back to sign in</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* Signed in, but Riki has not let them into the trainer yet. */
+function Waiting({ account, onRecheck, onSignOut }) {
+  const [busy, setBusy] = useState(false);
+  const first = String(account.full_name || account.handle).split(" ")[0];
+  return (
+    <div className="signin">
+      <div className="signin-inner narrow">
+        <img src={VCASO_LOGO} alt="VCASO Performance" className="vcaso-logo" />
+        <h1 className="h1 centre">Not yet, {first}</h1>
+        <p className="lede centre">
+          Your login works, but Riki has not switched the brake trainer on for you
+          yet. He can see you in his list. Message him if it is urgent.
+        </p>
+        <button className="btn primary wide" disabled={busy}
+          onClick={async () => { setBusy(true); await onRecheck(); setBusy(false); }}>
+          {busy ? "Checking…" : "Check again"}
+        </button>
+        <div className="signin-alt">
+          <button className="link" onClick={onSignOut}>Sign out</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Account ---------------- */
+function Account({ account, onLeaderboard, onSignOut, onBack }) {
+  const [pw, setPw] = useState("");
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const change = async (e) => {
+    e.preventDefault();
+    if (pw.length < 8) { setErr("Make it at least 8 characters."); return; }
+    setBusy(true); setErr(""); setMsg("");
+    try {
+      await cloud.changePassword(pw);
+      setPw(""); setMsg("Password changed. Use the new one next time.");
+    } catch (e2) { setErr(String(e2?.message || e2)); }
+    setBusy(false);
+  };
+
+  return (
+    <div className="cal">
+      <div className="topbar">
+        <h1 className="wordmark sm">Account</h1>
+        <button className="btn sm" onClick={onBack}>Back to garage</button>
+      </div>
+
+      <div className="panelbox">
+        <h2 className="h2">Signed in as</h2>
+        <p className="big-name">{account?.full_name || account?.handle}</p>
+        <p className="fine">
+          Username <span className="num">{account?.handle}</span>
+          {account?.role === "coach" ? " · coach" : ""}
+        </p>
+      </div>
+
+      <div className="panelbox">
+        <h2 className="h2">Leaderboard</h2>
+        <label className="check big-check">
+          <input type="checkbox" checked={!!account?.on_leaderboard}
+            onChange={(e) => onLeaderboard(e.target.checked)} />
+          Show my name and scores on the leaderboard
+        </label>
+        <p className="fine">
+          Turn this off and you disappear from every board for everyone. Your runs
+          are still saved and Riki can still see them — this only controls whether
+          other drivers see you ranked.
+        </p>
+      </div>
+
+      <div className="panelbox">
+        <h2 className="h2">Change your password</h2>
+        <form onSubmit={change} className="inline-form">
+          <input className="field" type="password" value={pw} minLength={8}
+            autoComplete="new-password" placeholder="New password, 8 characters or more"
+            onChange={(e) => setPw(e.target.value)} />
+          <button className="btn" type="submit" disabled={busy || pw.length < 8}>
+            {busy ? "Changing…" : "Change"}
+          </button>
+        </form>
+        {msg && <p className="ok-note">{msg}</p>}
+        {err && <div className="err">{err}</div>}
+        <p className="fine">
+          Worth doing once, so the password Riki messaged you is no longer the one
+          that opens your account.
+        </p>
+      </div>
+
+      <div className="cal-actions">
+        <button className="btn" onClick={onSignOut}>Sign out</button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Access requests (coach only) ----------------
+   Approving creates the login server-side and hands back a password once.
+   It is never stored in readable form, so if this screen is closed before
+   it is copied, the only way back is to issue a new one. */
+function Requests({ onBack }) {
+  const [rows, setRows] = useState(null);
+  const [drivers, setDrivers] = useState([]);
+  const [err, setErr] = useState("");
+  const [busyId, setBusyId] = useState("");
+  const [issued, setIssued] = useState(null);
+  const [handles, setHandles] = useState({});
+  const [copied, setCopied] = useState(false);
+
+  const suggest = (name, wanted) =>
+    wanted || String(name).trim().toLowerCase().split(/\s+/)[0].replace(/[^a-z0-9]/g, "");
+
+  const load = useCallback(async () => {
+    setErr("");
+    try {
+      const [r, d] = await Promise.all([cloud.pendingRequests(), cloud.drivers()]);
+      setRows(r);
+      setDrivers(d);
+      setHandles(Object.fromEntries(r.map((x) => [x.id, suggest(x.full_name, x.wanted_handle)])));
+    } catch (e) { setErr(String(e?.message || e)); setRows([]); }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const approve = async (row) => {
+    const handle = (handles[row.id] || "").trim().toLowerCase();
+    if (!/^[a-z][a-z0-9]{1,19}$/.test(handle)) {
+      setErr("Username must start with a letter, then letters or numbers only, 2 to 20 characters.");
+      return;
+    }
+    setBusyId(row.id); setErr("");
+    try {
+      const out = await cloud.approve(row.id, handle, row.full_name);
+      setIssued({ handle: out.handle, password: out.password, name: row.full_name, existed: out.existed });
+      setCopied(false);
+      await load();
+    } catch (e) { setErr(String(e?.message || e)); }
+    setBusyId("");
+  };
+
+  const decline = async (row) => {
+    setBusyId(row.id); setErr("");
+    try { await cloud.decline(row.id); await load(); }
+    catch (e) { setErr(String(e?.message || e)); }
+    setBusyId("");
+  };
+
+  const reissue = async (d) => {
+    setBusyId(d.id); setErr("");
+    try {
+      const out = await cloud.newPassword(d.id);
+      setIssued({ handle: out.handle, password: out.password, name: d.full_name || d.handle, reissued: true });
+      setCopied(false);
+    } catch (e) { setErr(String(e?.message || e)); }
+    setBusyId("");
+  };
+
+  const copy = async (text) => {
+    try { await navigator.clipboard.writeText(text); setCopied(true); }
+    catch { setCopied(false); }
+  };
+
+  if (issued) {
+    const message =
+      "Brake Trainer is ready for you.\n\n" +
+      "Open: https://rikichristo.github.io/brake-trainer/\n" +
+      `Username: ${issued.handle}\n` +
+      `Password: ${issued.password}\n\n` +
+      "Change the password once you are in, under Account.";
+    return (
+      <div className="cal">
+        <div className="topbar">
+          <h1 className="wordmark sm">{issued.reissued ? "New password" : "Approved"}</h1>
+          <button className="btn sm" onClick={() => setIssued(null)}>Back to the list</button>
+        </div>
+        <div className="panelbox">
+          <h2 className="h2">{issued.name}</h2>
+          <p className="lede">
+            Send this to them now. The password is not stored anywhere readable, so
+            once you leave this screen the only option is to issue a new one.
+          </p>
+          <pre className="issued num">{message}</pre>
+          <div className="cal-actions">
+            <button className="btn primary" onClick={() => copy(message)}>
+              {copied ? "Copied" : "Copy the message"}
+            </button>
+            <button className="btn" onClick={() => copy(issued.password)}>Copy just the password</button>
+          </div>
+          {issued.existed && (
+            <p className="fine">
+              That username already existed, so their old password has been replaced
+              by this one.
+            </p>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="cal">
+      <div className="topbar">
+        <h1 className="wordmark sm">Access requests</h1>
+        <div className="dock-actions">
+          <button className="btn sm" onClick={load}>Refresh</button>
+          <button className="btn sm" onClick={onBack}>Back to garage</button>
+        </div>
+      </div>
+
+      {err && <div className="err">{err}</div>}
+
+      {rows === null && <p className="lede">Loading…</p>}
+      {rows && rows.length === 0 && (
+        <p className="lede">
+          Nobody is waiting. Requests appear here when a driver asks from the sign-in
+          screen, with their name and how to reach them.
+        </p>
+      )}
+
+      {rows && rows.length > 0 && (
+        <ul className="reqs">
+          {rows.map((r) => (
+            <li className="req" key={r.id}>
+              <div className="req-main">
+                <span className="req-name">{r.full_name}</span>
+                {r.contact && <span className="req-contact">{r.contact}</span>}
+                {r.note && <p className="req-note">{r.note}</p>}
+                <span className="fine">
+                  Asked {new Date(r.created_at).toLocaleDateString()} at{" "}
+                  {new Date(r.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                </span>
+              </div>
+              <div className="req-act">
+                <label className="lbl tight">Username
+                  <input className="field sm" value={handles[r.id] ?? ""}
+                    autoCapitalize="none" spellCheck="false"
+                    onChange={(e) => setHandles((p) => ({ ...p, [r.id]: e.target.value }))} />
+                </label>
+                <button className="btn primary sm" disabled={busyId === r.id}
+                  onClick={() => approve(r)}>
+                  {busyId === r.id ? "Working…" : "Approve"}
+                </button>
+                <button className="btn sm" disabled={busyId === r.id} onClick={() => decline(r)}>
+                  Decline
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="block">
+        <h2 className="h2">Everyone with a trainer login</h2>
+        <table className="tbl">
+          <thead>
+            <tr><th>Driver</th><th>Username</th><th>Trainer</th><th>Board</th><th /></tr>
+          </thead>
+          <tbody>
+            {drivers.map((d) => (
+              <tr key={d.id}>
+                <td>{(d.full_name || d.handle) + (d.role === "coach" ? " · coach" : "")}</td>
+                <td className="num dim">{d.handle}</td>
+                <td>
+                  <label className="check">
+                    <input type="checkbox" checked={!!d.approved}
+                      onChange={async (e) => {
+                        const on = e.target.checked;
+                        setDrivers((p) => p.map((x) => (x.id === d.id ? { ...x, approved: on } : x)));
+                        try { await cloud.setApproved(d.id, on); }
+                        catch (e2) {
+                          setErr(String(e2?.message || e2));
+                          setDrivers((p) => p.map((x) => (x.id === d.id ? { ...x, approved: !on } : x)));
+                        }
+                      }} />
+                    in
+                  </label>
+                </td>
+                <td className="dim">{d.on_leaderboard ? "shown" : "hidden"}</td>
+                <td className="log-act">
+                  <button className="btn sm" disabled={busyId === d.id} onClick={() => reissue(d)}>
+                    New password
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <p className="fine">
+          Turning someone off here blocks the trainer for them immediately, without
+          touching their hub login.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Leaderboard ---------------- */
+function Leaderboard({ lapKey, lapLabel, onBack }) {
+  const [tab, setTab] = useState("lap");
+  const [lapRows, setLapRows] = useState(null);
+  const [allRows, setAllRows] = useState(null);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    let gone = false;
+    (async () => {
+      try {
+        const [a, b] = await Promise.all([cloud.board(lapKey), cloud.boardOverall()]);
+        if (gone) return;
+        setLapRows(a); setAllRows(b);
+      } catch (e) {
+        if (!gone) { setErr(String(e?.message || e)); setLapRows([]); setAllRows([]); }
+      }
+    })();
+    return () => { gone = true; };
+  }, [lapKey]);
+
+  const rows = tab === "lap" ? lapRows : allRows;
+
+  return (
+    <div className="cal">
+      <div className="topbar">
+        <h1 className="wordmark sm">Leaderboard</h1>
+        <button className="btn sm" onClick={onBack}>Back to garage</button>
+      </div>
+
+      <div className="cats">
+        <button className={`cat ${tab === "lap" ? "on" : ""}`} onClick={() => setTab("lap")}>
+          This drill
+        </button>
+        <button className={`cat ${tab === "all" ? "on" : ""}`} onClick={() => setTab("all")}>
+          All round
+        </button>
+      </div>
+      <p className="cat-note">
+        {tab === "lap"
+          ? lapLabel
+          : "Each driver's average of their best score on every drill they have run."}
+      </p>
+
+      {err && <div className="err">{err}</div>}
+      {rows === null && <p className="lede">Loading…</p>}
+
+      {rows && rows.length === 0 && (
+        <p className="lede">
+          {tab === "lap" ? "No scores on this drill yet. Be the first." : "No scores yet."}
+        </p>
+      )}
+
+      {rows && rows.length > 0 && (
+        <table className="tbl board">
+          <thead>
+            {tab === "lap" ? (
+              <tr><th>#</th><th>Driver</th><th>Best</th><th>Runs</th><th>Last</th></tr>
+            ) : (
+              <tr><th>#</th><th>Driver</th><th>Average</th><th>Best</th><th>Drills</th><th>Runs</th></tr>
+            )}
+          </thead>
+          <tbody>
+            {rows.map((r, i) => (
+              <tr key={`${r.display_name}-${i}`} className={r.is_me ? "me" : ""}>
+                <td className="num dim">{i + 1}</td>
+                <td>{(r.display_name || "Driver") + (r.is_me ? " · you" : "")}</td>
+                {tab === "lap" ? (
+                  <>
+                    <td className="num">{Math.round(r.best)}</td>
+                    <td className="num dim">{r.runs}</td>
+                    <td className="dim">{new Date(r.last_at).toLocaleDateString()}</td>
+                  </>
+                ) : (
+                  <>
+                    <td className="num">{Number(r.avg_best).toFixed(1)}</td>
+                    <td className="num dim">{Math.round(r.best)}</td>
+                    <td className="num dim">{r.laps}</td>
+                    <td className="num dim">{r.runs}</td>
+                  </>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <p className="fine">
+        Only drivers who have left themselves on the board appear here. Anyone can
+        turn that off under Account without losing their own history.
+      </p>
     </div>
   );
 }
@@ -1639,7 +2560,7 @@ function removeDriver(id) {
   store.remove(`bt:bests:${id}`);
 }
 
-function DriverSelect({ onPick }) {
+function DriverSelect({ onPick, onBack = null }) {
   const [drivers, setDrivers] = useState(() => loadDrivers());
   const [name, setName] = useState("");
   const [adding, setAdding] = useState(() => loadDrivers().length === 0);
@@ -1729,10 +2650,15 @@ function DriverSelect({ onPick }) {
         <p className="fine">
           A profile keeps each driver's settings, bests and run history separate,
           and stamps every run with who drove it. It is not a password — anyone
-          who can open this page can open any profile. Each rig keeps its own
-          profiles and history; runs travel between them as files, through the
-          logbook.
+          who can open this page can open any profile. Nothing here leaves this
+          machine, so there is no leaderboard and Riki cannot see these runs.
+          Sign in with an account for that.
         </p>
+        {onBack && (
+          <div className="signin-alt">
+            <button className="link" onClick={onBack}>Sign in with an account instead</button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1740,10 +2666,12 @@ function DriverSelect({ onPick }) {
 
 /* ---------------- Garage ---------------- */
 function Garage({
-  driver, onSwitchDriver, cat, setCat, all, lapId, setLapId, fullLap, drills, drillId, setDrillId, lap,
-  cal, keyboard, setKeyboard, best, onImport, lapWarn, onDeleteLap,
-  onCalibrate, onFeel, onLogbook, onRenameZone, onStart,
+  driver, account, syncNote, onSwitchDriver, cat, setCat, all, lapId, setLapId, fullLap,
+  drills, drillId, setDrillId, lap, cal, keyboard, setKeyboard, best, onImport, lapWarn,
+  onDeleteLap, brakeOnly, setBrakeOnly, onCalibrate, onFeel, onLogbook, onRenameZone,
+  onAccount, onRequests, onBoard, onStart,
 }) {
+  const [pending, setPending] = useState(0);
   const [pads, setPads] = useState([]);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState("");
@@ -1760,6 +2688,21 @@ function Garage({
     window.addEventListener("gamepadconnected", scan);
     return () => { clearInterval(iv); window.removeEventListener("gamepadconnected", scan); };
   }, []);
+
+  /* Riki asked to be told when someone requests access. Without an email
+     provider wired up that means showing him the count wherever he already
+     looks, so the garage carries it and refreshes while the page is open. */
+  useEffect(() => {
+    if (account?.role !== "coach" || !cloud.ready()) return;
+    let gone = false;
+    const check = async () => {
+      try { const r = await cloud.pendingRequests(); if (!gone) setPending(r.length); }
+      catch { /* offline, leave the count alone */ }
+    };
+    check();
+    const iv = setInterval(check, 60000);
+    return () => { gone = true; clearInterval(iv); };
+  }, [account?.role]);
 
   const mapped = calMapped(cal);
   const missing = mapped ? calMissing(cal, pads) : [];
@@ -1792,10 +2735,21 @@ function Garage({
       <img src={VCASO_LOGO} alt="VCASO Performance" className="vcaso-logo top" />
       <header className="top">
         <span className="wordmark sm">Brake Trainer</span>
-        <button className="who-btn" onClick={onSwitchDriver}>
-          {driver?.name}<span className="who-sub">switch driver</span>
-        </button>
+        <div className="dock-actions">
+          {onBoard && <button className="btn ghost sm" onClick={onBoard}>Leaderboard</button>}
+          {onRequests && (
+            <button className="btn ghost sm" onClick={onRequests}>
+              Requests{pending > 0 ? ` (${pending})` : ""}
+            </button>
+          )}
+          {onAccount && <button className="btn ghost sm" onClick={onAccount}>Account</button>}
+          <button className="who-btn" onClick={onSwitchDriver}>
+            {driver?.name}
+            <span className="who-sub">{driver?.cloud ? "sign out" : "switch driver"}</span>
+          </button>
+        </div>
       </header>
+      {syncNote && <p className="err">{syncNote}</p>}
 
       <div className="cats">
         {cats.map((c) => {
@@ -1931,6 +2885,11 @@ function Garage({
           </div>
         </div>
         <div className="dock-actions">
+          <label className="check" title="Hide the throttle and steering traces and score the brake alone">
+            <input type="checkbox" checked={!!brakeOnly}
+              onChange={(e) => setBrakeOnly(e.target.checked)} />
+            <span>Brake only</span>
+          </label>
           <label className="check">
             <input type="checkbox" checked={keyboard} onChange={(e) => setKeyboard(e.target.checked)} />
             <span>Keyboard</span>
@@ -2362,7 +3321,7 @@ function Calibrate({ cal, onSave, onCancel }) {
 }
 
 /* ---------------- Run ---------------- */
-function Run({ lap, cal, keyboard, feel, label, onFinish, onAbort }) {
+function Run({ lap, cal, keyboard, feel, label, brakeOnly = false, onFinish, onAbort }) {
   const cvs = useRef(null);
   const wrap = useRef(null);
   const readInput = useInputDevice(cal, keyboard, feel);
@@ -2419,8 +3378,14 @@ function Run({ lap, cal, keyboard, feel, label, onFinish, onAbort }) {
     const ro = new ResizeObserver(resize);
     ro.observe(wrap.current);
 
+    /* Brake-only hands the whole canvas to one trace. The point of hiding the
+       other two is not just to clear the screen: a brake shape drawn three
+       times taller is a shape you can actually see yourself missing. */
     const lanes = () => {
       const pad = 18, gap = 16;
+      if (brakeOnly) {
+        return [{ key: "brake", label: "Brake", y: pad, h: H - pad * 2, signed: false }];
+      }
       const usable = H - pad * 2 - gap * 2;
       const bh = usable * 0.44, th = usable * 0.28, sh = usable * 0.28;
       return [
@@ -2605,7 +3570,7 @@ function Run({ lap, cal, keyboard, feel, label, onFinish, onAbort }) {
     };
     raf = requestAnimationFrame(loop);
     return () => { cancelAnimationFrame(raf); ro.disconnect(); };
-  }, [lap, readInput, onFinish]);
+  }, [lap, readInput, onFinish, brakeOnly]);
 
   const pre = hud.t < 0;
   return (
@@ -2855,7 +3820,10 @@ function Results({ r, best, saved, onRetry, onGarage }) {
           {isBest && <span className="pb">Personal best</span>}
         </div>
         <div className="bars">
-          {[["Brake", ch.brake, 45], ["Throttle", ch.throttle, 30], ["Steering", ch.steer, 25]].map(([n, c, wt]) => (
+          {(r.brakeOnly
+            ? [["Brake", ch.brake, 100]]
+            : [["Brake", ch.brake, 45], ["Throttle", ch.throttle, 30], ["Steering", ch.steer, 25]]
+          ).map(([n, c, wt]) => (
             <div key={n} className="bar-row">
               <span className="bar-name">{n}</span>
               <div className="bar"><div className="bar-fill" style={{ width: `${c.score}%` }} /></div>
@@ -3123,6 +4091,54 @@ function Styles() {
 .tbl td:first-child{text-align:left;}
 .z-name{color:var(--text);}
 .tbl .dim{color:var(--dimmer);}
+
+/* accounts, requests and the board */
+.topbar{display:flex; align-items:center; justify-content:space-between; gap:16px;
+  padding-bottom:16px; margin-bottom:20px; border-bottom:1px solid var(--line);}
+.centre{text-align:center;}
+.signin-inner.narrow{max-width:380px;}
+.muted{color:var(--dim);}
+.login{min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px;}
+.card-form{display:grid; gap:12px; border:1px solid var(--line); border-radius:6px;
+  background:var(--panel); padding:18px; margin-top:4px;}
+.lbl{display:grid; gap:5px; font-size:13px; color:var(--dim);}
+.lbl.tight{gap:3px; font-size:12px;}
+.hint{color:var(--dimmer); font-size:11.5px;}
+.signin-alt{display:flex; flex-direction:column; align-items:center; gap:8px; margin-top:16px;}
+.link{background:none; border:none; padding:2px 4px; color:var(--dim); font:inherit;
+  font-size:13px; cursor:pointer; text-decoration:underline; text-underline-offset:3px;
+  text-decoration-color:var(--line);}
+.link:hover{color:var(--text); text-decoration-color:var(--dim);}
+.panelbox{border:1px solid var(--line); border-radius:6px; background:var(--panel);
+  padding:18px; margin-bottom:16px; max-width:660px;}
+.big-name{font-size:21px; font-weight:600; letter-spacing:-0.01em; margin:0 0 6px;}
+.big-check{font-size:14.5px; color:var(--text);}
+.inline-form{display:flex; gap:8px; align-items:center; max-width:460px;}
+.inline-form .field{flex:1;}
+.ok-note{color:var(--good); font-size:13px; margin:10px 0 0;}
+.issued{background:var(--bg); border:1px solid var(--line); border-radius:4px;
+  padding:14px; font-size:13px; line-height:1.6; white-space:pre-wrap; word-break:break-word;
+  color:var(--text); margin:0 0 16px; max-width:52ch;}
+.field.sm{padding:5px 9px; font-size:13px; width:132px;}
+
+.reqs{list-style:none; margin:0 0 8px; padding:0; display:flex; flex-direction:column; gap:8px;}
+.req{display:flex; justify-content:space-between; align-items:flex-start; gap:22px;
+  flex-wrap:wrap; border:1px solid var(--line); border-left:2px solid var(--warn);
+  border-radius:4px; background:var(--panel); padding:15px 17px;}
+.req-main{display:flex; flex-direction:column; gap:3px; min-width:0;}
+.req-name{font-size:16px; font-weight:600;}
+.req-contact{font-size:13.5px; color:var(--good);}
+.req-note{color:var(--dim); font-size:13.5px; margin:5px 0 0; max-width:54ch;}
+.req-act{display:flex; align-items:flex-end; gap:8px; flex-wrap:wrap;}
+
+.tbl.board td{padding:10px 0;}
+.tbl.board tr.me td{color:var(--good);}
+.tbl .dim{color:var(--dimmer);}
+
+@media (max-width:620px){
+  .req{flex-direction:column; gap:12px;}
+  .req-act{align-items:stretch;}
+}
 
 @media (max-width:900px){
   .cols,.cal-body,.res-cols{grid-template-columns:1fr;}
