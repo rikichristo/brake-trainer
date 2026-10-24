@@ -2963,7 +2963,7 @@ function Styles() {
 .signin{min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px;}
 .signin-inner{width:100%; max-width:560px;}
 .vcaso-logo{display:block;height:28px;width:auto;margin:0 auto 28px}
-.vcaso-logo.top{display:block;flex:none;align-self:center;width:96px;height:auto;margin:6px auto 14px}
+.vcaso-logo.top{display:block!important;flex:none;align-self:center;width:96px!important;height:auto!important;margin:6px auto 14px}
 .signin-trace{width:100%; height:64px; display:block; margin-bottom:28px; opacity:.85;}
 .drivers{margin-bottom:12px;}
 .drivers li{display:flex; align-items:stretch; gap:6px;}
