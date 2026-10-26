@@ -2014,17 +2014,15 @@ export default function BrakeTrainer() {
   );
 }
 
-/* The flowing traces behind the sign-in. Three passes of a real lap of
-   Riki's, at different speeds and depths, so it reads as one shape moving
-   past rather than a repeating pattern. The brake line is the bright one —
-   it is what the whole product is about — with a second brake pass and a
-   throttle pass drifting slower behind it for depth. Pure white, because
-   everything else about the page is.
+/* A single brake trace flowing through a small window above the sign-in.
+   The full-screen version of this was too busy to read a form through —
+   traces behind the writing is noise, a contained strip is a detail. One
+   line only, with a soft fill under it and the edges faded so it reads as
+   something passing through rather than something cut off.
 
-   Deliberately cheap to draw: two-pixel steps, no shadows, no per-frame
-   allocation. It sits behind a form someone is typing into, and a sign-in
-   screen that makes a laptop fan spin up is a bad first impression. */
-function TraceField() {
+   Cheap on purpose: two-pixel steps, one path, no shadows. Frozen for
+   anyone who has asked their system for reduced motion. */
+function TraceStrip() {
   const cvs = useRef(null);
 
   useEffect(() => {
@@ -2048,65 +2046,56 @@ function TraceField() {
     const ro = new ResizeObserver(resize);
     ro.observe(c);
 
-    /* band is the share of the height this layer lives in, bottom-anchored,
-       so a trace rises out of its own baseline the way the real one does. */
-    /* span is how many seconds of the lap fit across the width. It wants to
-       be most of a lap: at fifteen seconds each braking event is the size of
-       a building and the whole thing reads as a skyline rather than as
-       telemetry. Near a full lap and you get the real rhythm of a circuit
-       going past — the quick jabs, the long heavy stops, the straights. */
-    const layers = [
-      { ch: "brake",    span: 58, speed: 1.00, alpha: 0.50, width: 1.8, band: [0.56, 0.88], fill: 0.035, off: 0 },
-      { ch: "brake",    span: 76, speed: 0.60, alpha: 0.20, width: 1.4, band: [0.33, 0.62], fill: 0,     off: 41 },
-      { ch: "throttle", span: 95, speed: 0.36, alpha: 0.10, width: 1.2, band: [0.12, 0.44], fill: 0,     off: 83 },
-    ];
-
     const draw = () => {
       const x = c.getContext("2d");
       if (!x) return;
       x.setTransform(dpr, 0, 0, dpr, 0, 0);
       x.clearRect(0, 0, W, H);
-      x.lineJoin = "round";
-      x.lineCap = "round";
-      x.strokeStyle = "#ffffff";
-      x.fillStyle = "#ffffff";
+
+      const pad = 4;
+      const bot = H - pad;
+      const h = H - pad * 2;
+      /* Sixteen seconds of lap across the strip. Enough that there is
+         usually a shape on screen rather than flat baseline, while a braking
+         event is still wide enough to read as a shape rather than a spike. */
+      const span = 16;
+      const at = (i) => {
+        const tt = (t + (i / W) * span) % lap.dur;
+        return bot - (lap.brake[idx(tt)] ?? 0) * h;
+      };
 
       const STEP = 2;
-      for (const L of layers) {
-        const bot = H * L.band[1];
-        const h = bot - H * L.band[0];
-        /* Hold the shapes at a readable width rather than a fixed number of
-           seconds. On a phone a full lap squeezed into 390px is a comb; this
-           keeps a braking event about as wide as it is on a laptop. */
-        const span = L.span * Math.min(1, Math.max(0.34, W / 980));
-        const at = (i) => {
-          const tt = (t * L.speed + L.off + (i / W) * span) % lap.dur;
-          return bot - (lap[L.ch][idx(tt)] ?? 0) * h;
-        };
+      x.fillStyle = "#ffffff";
+      x.globalAlpha = 0.07;
+      x.beginPath();
+      x.moveTo(0, bot);
+      for (let i = 0; i <= W; i += STEP) x.lineTo(i, at(i));
+      x.lineTo(W, bot);
+      x.closePath();
+      x.fill();
 
-        if (L.fill) {
-          x.globalAlpha = L.fill;
-          x.beginPath();
-          x.moveTo(0, bot);
-          for (let i = 0; i <= W; i += STEP) x.lineTo(i, at(i));
-          x.lineTo(W, bot);
-          x.closePath();
-          x.fill();
-        }
-
-        x.globalAlpha = L.alpha;
-        x.lineWidth = L.width;
-        x.beginPath();
-        for (let i = 0; i <= W; i += STEP) {
-          const y = at(i);
-          i === 0 ? x.moveTo(i, y) : x.lineTo(i, y);
-        }
-        x.stroke();
+      x.globalAlpha = 0.9;
+      x.strokeStyle = "#ffffff";
+      x.lineWidth = 1.6;
+      x.lineJoin = "round";
+      x.lineCap = "round";
+      x.beginPath();
+      for (let i = 0; i <= W; i += STEP) {
+        const y = at(i);
+        i === 0 ? x.moveTo(i, y) : x.lineTo(i, y);
       }
+      x.stroke();
+
+      x.globalAlpha = 0.14;
+      x.lineWidth = 1;
+      x.beginPath();
+      x.moveTo(0, bot + 0.5);
+      x.lineTo(W, bot + 0.5);
+      x.stroke();
       x.globalAlpha = 1;
 
       if (!reduce) {
-        t += 0.022;
+        t += 0.026;
         raf = requestAnimationFrame(draw);
       }
     };
@@ -2115,7 +2104,7 @@ function TraceField() {
     return () => { cancelAnimationFrame(raf); ro.disconnect(); };
   }, []);
 
-  return <canvas ref={cvs} className="trace-field" aria-hidden="true" />;
+  return <canvas ref={cvs} className="trace-strip" aria-hidden="true" />;
 }
 
 /* ---------------- Sign in ----------------
@@ -2153,11 +2142,11 @@ function SignIn({ onSignedIn, onLocal }) {
   if (asking) return <RequestAccess onBack={() => setAsking(false)} />;
 
   return (
-    <div className="signin hero">
-      <TraceField />
+    <div className="signin">
       <div className="signin-inner narrow">
         <img src={VCASO_LOGO} alt="VCASO Performance" className="vcaso-logo big" />
-        <h1 className="h1 centre">Brake Trainer</h1>
+        <h1 className="display-name">Brake Trainer</h1>
+        <TraceStrip />
         <p className="lede centre">
           {preview
             ? "This is a preview copy, so it cannot sign you in or reach the leaderboard."
@@ -2255,11 +2244,10 @@ function RequestAccess({ onBack }) {
   }
 
   return (
-    <div className="signin hero">
-      <TraceField />
+    <div className="signin">
       <div className="signin-inner narrow">
         <img src={VCASO_LOGO} alt="VCASO Performance" className="vcaso-logo" />
-        <h1 className="h1 centre">Ask for access</h1>
+        <h1 className="display-name sm">Ask for access</h1>
         <p className="lede centre">
           Riki approves drivers one at a time. Leave your name and how to reach you.
         </p>
@@ -4061,8 +4049,9 @@ function Styles() {
 .bt-root button:focus-visible,.bt-root input:focus-visible,.bt-root select:focus-visible{outline:2px solid var(--ui); outline-offset:2px;}
 .hidden{display:none;}
 
-.wordmark{font-size:34px; font-weight:600; letter-spacing:-0.03em; margin:0 0 14px;}
-.wordmark.sm{font-size:16px; font-weight:600; letter-spacing:-0.01em; margin:0;}
+.wordmark{font-family:"Michroma","Eurostile","Bank Gothic",ui-sans-serif,system-ui,sans-serif;
+  font-size:23px; font-weight:400; letter-spacing:.1em; text-transform:uppercase; margin:0 0 16px;}
+.wordmark.sm{font-size:13px; font-weight:400; letter-spacing:.11em; margin:0;}
 .h1{font-size:24px; font-weight:600; letter-spacing:-0.02em; margin:0 0 10px;}
 .h2{font-size:13px; font-weight:500; color:var(--dim); margin:0 0 12px;}
 .lede{color:var(--dim); max-width:56ch; margin:0 0 20px;}
@@ -4254,32 +4243,28 @@ function Styles() {
 .preview-note a{display:block; text-decoration:none;}
 .preview-note .fine{margin:10px 0 0;}
 
-/* the flowing traces behind the front door */
-.signin.hero{position:relative; overflow:hidden;}
-.trace-field{position:absolute; inset:0; width:100%; height:100%; display:block;
-  pointer-events:none; z-index:0;
-  /* In a mask, opaque shows and transparent hides. The middle is where the
-     logo, the form and the small print live, so that is the part to hide;
-     the traces run out to the edges where there is nothing to read. */
-  -webkit-mask-image:radial-gradient(ellipse 62% 52% at 50% 46%,
-    transparent 22%, rgba(0,0,0,0.5) 64%, #000 100%);
-  mask-image:radial-gradient(ellipse 62% 52% at 50% 46%,
-    transparent 22%, rgba(0,0,0,0.5) 64%, #000 100%);}
-.signin.hero .signin-inner{position:relative; z-index:1;}
-.vcaso-logo.big{height:38px; margin:0 auto 32px;}
-/* The card sits over a moving background, so it needs to be opaque enough
-   to read against a trace passing underneath it. */
-.signin.hero .card-form{background:rgba(8,8,8,0.92); backdrop-filter:blur(6px);
-  -webkit-backdrop-filter:blur(6px);}
+/* the front door */
+.vcaso-logo.big{height:34px; margin:0 auto 22px;}
+
+/* Michroma is the closest widely available face to the VCASO wordmark —
+   same squared, wide, geometric letterforms — so the product name reads as
+   part of the mark rather than as a caption under it. Falls back to the
+   nearest grotesques if the webfont never loads. */
+.display-name{font-family:"Michroma","Eurostile","Bank Gothic",ui-sans-serif,
+  system-ui,-apple-system,sans-serif;
+  font-weight:400; font-size:17px; letter-spacing:.11em; text-transform:uppercase;
+  text-align:center; margin:0 0 20px; line-height:1.4;}
+.display-name.sm{font-size:14px; letter-spacing:.1em;}
+
+/* the trace, in its own window */
+.trace-strip{width:100%; height:64px; display:block; margin:0 0 24px;
+  -webkit-mask-image:linear-gradient(90deg,transparent,#000 14%,#000 86%,transparent);
+  mask-image:linear-gradient(90deg,transparent,#000 14%,#000 86%,transparent);}
+
 @media (max-width:620px){
-  .vcaso-logo.big{height:30px; margin-bottom:26px;}
-  /* A phone is tall and narrow, so the small print below the card falls
-     outside an ellipse sized for a laptop. Protect more of the middle. */
-  .trace-field{opacity:.7;
-    -webkit-mask-image:radial-gradient(ellipse 92% 64% at 50% 50%,
-      transparent 34%, rgba(0,0,0,0.42) 74%, #000 100%);
-    mask-image:radial-gradient(ellipse 92% 64% at 50% 50%,
-      transparent 34%, rgba(0,0,0,0.42) 74%, #000 100%);}
+  .vcaso-logo.big{height:28px; margin-bottom:18px;}
+  .display-name{font-size:14px; letter-spacing:.09em;}
+  .trace-strip{height:54px; margin-bottom:20px;}
 }
 
 /* accounts, requests and the board */

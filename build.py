@@ -25,6 +25,16 @@ SUPABASE_CDN = (
     "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"
 )
 
+# Michroma is the closest widely available match to the VCASO wordmark. Loaded
+# from Google Fonts with a preconnect; if it never arrives the stack falls back
+# to the nearest grotesques and the page is unaffected.
+FONT = (
+    '<link rel="preconnect" href="https://fonts.googleapis.com">\n'
+    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
+    '<link rel="stylesheet" '
+    'href="https://fonts.googleapis.com/css2?family=Michroma&display=swap">\n'
+)
+
 STYLE = """<style>
   /* Single-dark by design: white reference traces on black, so there is no light theme. */
   :root{
@@ -107,14 +117,14 @@ def main() -> int:
     supa = f'<script src="{SUPABASE_CDN}"></script>'
 
     art = (
-        f"<title>Brake Trainer</title>\n{STYLE}\n\n"
+        f"<title>Brake Trainer</title>\n{FONT}{STYLE}\n\n"
         '<div id="root"></div>\n<div id="boot">Loading Brake Trainer&hellip;</div>\n\n'
         f"{BOOTJS}\n\n{supa}\n<script>\n{bundle}\n</script>\n"
     )
     OUT_ART.write_text(art)
 
     std = (
-        f'<!doctype html>\n<html lang="en">\n<head>\n{HEAD}{STYLE}\n</head>\n<body>\n'
+        f'<!doctype html>\n<html lang="en">\n<head>\n{HEAD}{FONT}{STYLE}\n</head>\n<body>\n'
         '<div id="root"></div>\n<div id="boot">Loading Brake Trainer&hellip;</div>\n\n'
         f"{BOOTJS}\n\n{supa}\n<script>\n{bundle}\n</script>\n</body>\n</html>\n"
     )
