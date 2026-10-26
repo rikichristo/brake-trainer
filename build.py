@@ -85,6 +85,20 @@ ICON = (
     "%3C/svg%3E"
 )
 
+# Only the hosted copy can resolve these, and only the hosted copy is ever
+# added to a home screen. Without an explicit apple-touch-icon, iOS falls back
+# to whatever it can find at the root of the origin — and rikichristo.github.io
+# hosts more than one site, so the trainer was showing another one's icon.
+ICONS = (
+    '<link rel="apple-touch-icon" href="apple-touch-icon.png">\n'
+    '<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">\n'
+    '<link rel="manifest" href="manifest.webmanifest">\n'
+    '<meta name="apple-mobile-web-app-title" content="Brake Trainer">\n'
+    '<meta name="apple-mobile-web-app-capable" content="yes">\n'
+    '<meta name="apple-mobile-web-app-status-bar-style" content="black">\n'
+    '<meta name="theme-color" content="#000000">\n'
+)
+
 HEAD = (
     '<meta charset="utf-8">\n'
     '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n'
@@ -124,7 +138,7 @@ def main() -> int:
     OUT_ART.write_text(art)
 
     std = (
-        f'<!doctype html>\n<html lang="en">\n<head>\n{HEAD}{FONT}{STYLE}\n</head>\n<body>\n'
+        f'<!doctype html>\n<html lang="en">\n<head>\n{HEAD}{ICONS}{FONT}{STYLE}\n</head>\n<body>\n'
         '<div id="root"></div>\n<div id="boot">Loading Brake Trainer&hellip;</div>\n\n'
         f"{BOOTJS}\n\n{supa}\n<script>\n{bundle}\n</script>\n</body>\n</html>\n"
     )
