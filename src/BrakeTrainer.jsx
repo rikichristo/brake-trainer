@@ -348,8 +348,9 @@ const CATEGORIES = {
   f4: { key: "f4", name: "Formula 4", note: "Lower peak pressures and longer zones. Patient throttle pickup out of the slow corners." },
   f3: { key: "f3", name: "Formula 3", note: "More downforce, so Copse and Becketts go flat. Later, harder, shorter braking everywhere else." },
   f2: { key: "f2", name: "Formula 2", note: "No laps logged yet. Record a session in an F2-class car and it will appear here." },
+  gt: { key: "gt", name: "GT", note: "No laps logged yet. Import a GT session and it will appear here. Expect a different shape to the formula cars: heavier car, longer zones, and a flatter peak you can lean on for longer." },
 };
-const CATEGORY_ORDER = ["f4", "f3", "f2"];
+const CATEGORY_ORDER = ["f4", "f3", "f2", "gt"];
 
 /* Decode once; the arrays are read every frame during a session. */
 const LAPS = LAP_DATA.map((rec) => {
@@ -4260,6 +4261,16 @@ function Styles() {
 .trace-strip{width:100%; height:64px; display:block; margin:0 0 24px;
   -webkit-mask-image:linear-gradient(90deg,transparent,#000 14%,#000 86%,transparent);
   mask-image:linear-gradient(90deg,transparent,#000 14%,#000 86%,transparent);}
+
+/* Three buttons and a name do not fit beside the title on a phone, and the
+   overflow pushed "sign out" off the right edge where it could not be
+   reached. Let the row wrap instead. */
+@media (max-width:760px){
+  .top{flex-wrap:wrap; row-gap:12px;}
+  .top .dock-actions{width:100%; justify-content:flex-start; flex-wrap:wrap; gap:8px;}
+  .top .who-btn{margin-left:auto; text-align:right;}
+  .cat{padding:7px 14px; font-size:13.5px;}
+}
 
 @media (max-width:620px){
   .vcaso-logo.big{height:28px; margin-bottom:18px;}
