@@ -14,18 +14,25 @@ const LOOKAHEAD = 5.0;         // seconds of trace visible ahead of it
 const LEADIN = 4.0;            // roll-in before the lap starts
 const PLAYHEAD = LOOKBACK / (LOOKBACK + LOOKAHEAD);
 
+/* Black and white, with colour reserved for information.
+   `ui` is the accent for anything you press or that is selected — white, so
+   the interface reads as one thing. `good` / `warn` / `bad` stay for the
+   traces and the fault colouring, where green against red is the whole point
+   of looking at the screen. Greys are neutral rather than green-tinted, so
+   white actually looks white next to them. */
 const C = {
   bg: "#000000",
-  panel: "#0d0f0e",
-  panel2: "#141817",
-  line: "#232827",
+  panel: "#0a0a0a",
+  panel2: "#141414",
+  line: "#262626",
   ref: "#ffffff",
+  ui: "#ffffff",
   good: "#7ee0a3",
   warn: "#e3b45a",
   bad: "#ff6b5e",
-  text: "#f2f5f4",
-  dim: "#7b8481",
-  dimmer: "#4a5250",
+  text: "#ffffff",
+  dim: "#8f8f8f",
+  dimmer: "#575757",
 };
 
 /* ------------------------------------------------------------
@@ -60,8 +67,7 @@ const idx = (t) => Math.round(t * HZ);
 
 /* ------------------------------------------------------------
    THE ACCOUNT SIDE
-   Same Supabase project and the same logins as the Rodin Hub, so a
-   driver types the username and password they already have. Everything
+   VCASO Performance drivers, in Riki's own Supabase project. Everything
    here is optional by design: if the CDN script never loaded, or the rig
    is off the internet, `cloud.ready()` is false and the app falls back
    to the local profiles it has always had. A sim rig in a garage with no
@@ -99,8 +105,8 @@ const netMessage = (e) => {
 const SUPA_URL = "https://bqvygaqvwmakbrxnllws.supabase.co";
 const SUPA_KEY = "sb_publishable_M8zD44AbCWO1rjBdWVbGJA_lfRLKvwz";
 const DRIVER_DOMAIN = "drivers.rikichristo.com";
-/* Riki's login predates the drivers domain, so it is spelled out rather
-   than guessed — exactly the alias the hub uses. */
+/* Riki's own login predates the drivers domain, so it is spelled out
+   rather than guessed. */
 const HANDLE_ALIAS = { riki: "riki@rikichristo.com" };
 
 const emailFor = (raw) => {
@@ -2008,10 +2014,105 @@ export default function BrakeTrainer() {
   );
 }
 
+/* The flowing traces behind the sign-in. Three passes of a real lap of
+   Riki's, at different speeds and depths, so it reads as one shape moving
+   past rather than a repeating pattern. The brake line is the bright one —
+   it is what the whole product is about — with a second brake pass and a
+   throttle pass drifting slower behind it for depth. Pure white, because
+   everything else about the page is.
+
+   Deliberately cheap to draw: two-pixel steps, no shadows, no per-frame
+   allocation. It sits behind a form someone is typing into, and a sign-in
+   screen that makes a laptop fan spin up is a bad first impression. */
+function TraceField() {
+  const cvs = useRef(null);
+
+  useEffect(() => {
+    const c = cvs.current;
+    const lap = LAPS[0];
+    if (!c || !lap) return;
+
+    const reduce = typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    let raf = 0, t = 0, W = 0, H = 0, dpr = 1;
+
+    const resize = () => {
+      dpr = Math.min(2, window.devicePixelRatio || 1);
+      W = c.clientWidth || 1;
+      H = c.clientHeight || 1;
+      c.width = Math.round(W * dpr);
+      c.height = Math.round(H * dpr);
+    };
+    resize();
+    const ro = new ResizeObserver(resize);
+    ro.observe(c);
+
+    /* band is the share of the height this layer lives in, bottom-anchored,
+       so a trace rises out of its own baseline the way the real one does. */
+    const layers = [
+      { ch: "brake",    span: 15, speed: 1.00, alpha: 0.85, width: 2.0, band: [0.46, 0.93], fill: 0.055, off: 0 },
+      { ch: "brake",    span: 23, speed: 0.58, alpha: 0.26, width: 1.5, band: [0.26, 0.70], fill: 0,     off: 41 },
+      { ch: "throttle", span: 34, speed: 0.34, alpha: 0.12, width: 1.3, band: [0.08, 0.52], fill: 0,     off: 83 },
+    ];
+
+    const draw = () => {
+      const x = c.getContext("2d");
+      if (!x) return;
+      x.setTransform(dpr, 0, 0, dpr, 0, 0);
+      x.clearRect(0, 0, W, H);
+      x.lineJoin = "round";
+      x.lineCap = "round";
+      x.strokeStyle = "#ffffff";
+      x.fillStyle = "#ffffff";
+
+      const STEP = 2;
+      for (const L of layers) {
+        const bot = H * L.band[1];
+        const h = bot - H * L.band[0];
+        const at = (i) => {
+          const tt = (t * L.speed + L.off + (i / W) * L.span) % lap.dur;
+          return bot - (lap[L.ch][idx(tt)] ?? 0) * h;
+        };
+
+        if (L.fill) {
+          x.globalAlpha = L.fill;
+          x.beginPath();
+          x.moveTo(0, bot);
+          for (let i = 0; i <= W; i += STEP) x.lineTo(i, at(i));
+          x.lineTo(W, bot);
+          x.closePath();
+          x.fill();
+        }
+
+        x.globalAlpha = L.alpha;
+        x.lineWidth = L.width;
+        x.beginPath();
+        for (let i = 0; i <= W; i += STEP) {
+          const y = at(i);
+          i === 0 ? x.moveTo(i, y) : x.lineTo(i, y);
+        }
+        x.stroke();
+      }
+      x.globalAlpha = 1;
+
+      if (!reduce) {
+        t += 0.022;
+        raf = requestAnimationFrame(draw);
+      }
+    };
+
+    draw();
+    return () => { cancelAnimationFrame(raf); ro.disconnect(); };
+  }, []);
+
+  return <canvas ref={cvs} className="trace-field" aria-hidden="true" />;
+}
+
 /* ---------------- Sign in ----------------
-   The same front door as the Rodin Hub, on purpose: same project, same
-   accounts, same wording. A driver who already has a hub login types the
-   username and password they already know and it simply works. */
+   The front door of the product. A driver's username is their first name;
+   the password is the one Riki sent them. The traces behind it are a real
+   lap of his, flowing past — the thing they are about to try to match. */
 function SignIn({ onSignedIn, onLocal }) {
   const [handle, setHandle] = useState("");
   const [pass, setPass] = useState("");
@@ -2043,9 +2144,10 @@ function SignIn({ onSignedIn, onLocal }) {
   if (asking) return <RequestAccess onBack={() => setAsking(false)} />;
 
   return (
-    <div className="signin">
+    <div className="signin hero">
+      <TraceField />
       <div className="signin-inner narrow">
-        <img src={VCASO_LOGO} alt="VCASO Performance" className="vcaso-logo" />
+        <img src={VCASO_LOGO} alt="VCASO Performance" className="vcaso-logo big" />
         <h1 className="h1 centre">Brake Trainer</h1>
         <p className="lede centre">
           {preview
@@ -2144,7 +2246,8 @@ function RequestAccess({ onBack }) {
   }
 
   return (
-    <div className="signin">
+    <div className="signin hero">
+      <TraceField />
       <div className="signin-inner narrow">
         <img src={VCASO_LOGO} alt="VCASO Performance" className="vcaso-logo" />
         <h1 className="h1 centre">Ask for access</h1>
@@ -3752,7 +3855,7 @@ function Logbook({ driver, onOpen, onBack }) {
                 <td className="num">{r.brake}</td>
                 <td className="num">{r.throttle}</td>
                 <td className="num">{r.steer}</td>
-                <td className="num" style={{ color: r.overall > 75 ? C.good : r.overall > 50 ? C.warn : C.bad }}>
+                <td className="num" style={{ color: r.overall > 75 ? C.text : r.overall > 50 ? C.warn : C.bad }}>
                   {r.overall}
                 </td>
                 <td className="log-act">
@@ -3921,7 +4024,7 @@ function Results({ r, best, saved, onRetry, onGarage }) {
                   <td className="num">{Math.round(z.drvPeak * 100)}%</td>
                   <td className="num dim">{Math.round(z.refPeak * 100)}%</td>
                   <td className="num">{z.bpDelta === null ? "—" : `${z.bpDelta > 0 ? "+" : ""}${(z.bpDelta * 1000).toFixed(0)}ms`}</td>
-                  <td className="num" style={{ color: z.score > 75 ? C.good : z.score > 50 ? C.warn : C.bad }}>{z.score}</td>
+                  <td className="num" style={{ color: z.score > 75 ? C.text : z.score > 50 ? C.warn : C.bad }}>{z.score}</td>
                 </tr>
               ))}
             </tbody>
@@ -3939,14 +4042,14 @@ function Styles() {
 .bt-root{
   --bg:${C.bg}; --panel:${C.panel}; --panel2:${C.panel2}; --line:${C.line};
   --text:${C.text}; --dim:${C.dim}; --dimmer:${C.dimmer};
-  --good:${C.good}; --warn:${C.warn}; --bad:${C.bad};
+  --ui:${C.ui}; --good:${C.good}; --warn:${C.warn}; --bad:${C.bad};
   background:var(--bg); color:var(--text); min-height:100vh;
   font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
   font-size:15px; line-height:1.5; -webkit-font-smoothing:antialiased;
 }
 .bt-root *{box-sizing:border-box;}
 .bt-root .num{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-variant-numeric:tabular-nums; letter-spacing:-0.01em;}
-.bt-root button:focus-visible,.bt-root input:focus-visible,.bt-root select:focus-visible{outline:2px solid var(--good); outline-offset:2px;}
+.bt-root button:focus-visible,.bt-root input:focus-visible,.bt-root select:focus-visible{outline:2px solid var(--ui); outline-offset:2px;}
 .hidden{display:none;}
 
 .wordmark{font-size:34px; font-weight:600; letter-spacing:-0.03em; margin:0 0 14px;}
@@ -3956,19 +4059,19 @@ function Styles() {
 .lede{color:var(--dim); max-width:56ch; margin:0 0 20px;}
 .fine{color:var(--dimmer); font-size:12.5px; max-width:64ch; margin:12px 0 0;}
 .err{color:var(--bad); font-size:13px; margin-top:10px; line-height:1.45;
-  background:#2a1512; border-left:2px solid var(--bad); padding:10px 12px; border-radius:2px;}
+  background:#2a1512; border-left:2px solid var(--bad); padding:11px 14px; border-radius:12px;}
 
 .btn{border:1px solid var(--line); background:transparent; color:var(--text);
-  padding:9px 16px; border-radius:3px; font-size:14px; cursor:pointer; font-family:inherit;
+  padding:9px 18px; border-radius:999px; font-size:14px; cursor:pointer; font-family:inherit;
   transition:border-color .12s, background .12s;}
-.btn:hover:not(:disabled){border-color:#3d4442;}
+.btn:hover:not(:disabled){border-color:var(--ui);}
 .btn:disabled{opacity:.32; cursor:not-allowed;}
-.btn.primary{background:var(--good); border-color:var(--good); color:#04120a; font-weight:600;}
-.btn.primary:hover:not(:disabled){background:#96e9b5; border-color:#96e9b5;}
+.btn.primary{background:var(--ui); border-color:var(--ui); color:#000; font-weight:600;}
+.btn.primary:hover:not(:disabled){background:#e4e4e4; border-color:#e4e4e4;}
 .btn.sm{padding:5px 11px; font-size:13px;}
 .btn.wide{width:100%; margin-top:10px;}
 .field{background:var(--panel2); border:1px solid var(--line); color:var(--text);
-  padding:9px 12px; border-radius:3px; font-size:14px; font-family:inherit; width:100%;}
+  padding:10px 14px; border-radius:12px; font-size:14px; font-family:inherit; width:100%;}
 .field::placeholder{color:var(--dimmer);}
 
 /* sign in */
@@ -3981,7 +4084,7 @@ function Styles() {
 .drivers li{display:flex; align-items:stretch; gap:6px;}
 .drivers li .item{flex:1;}
 .x{background:transparent; border:1px solid var(--line); color:var(--dimmer);
-  min-width:34px; padding:0 8px; border-radius:3px; cursor:pointer; font-size:16px;
+  min-width:34px; padding:0 8px; border-radius:999px; cursor:pointer; font-size:16px;
   line-height:1; font-family:inherit;}
 .x.armed{color:var(--bad); border-color:var(--bad); font-size:12px;}
 .x:hover{color:var(--bad); border-color:#3d4442;}
@@ -3999,8 +4102,8 @@ function Styles() {
 .who{color:var(--dim); font-size:14px;}
 .cats{display:flex; gap:6px; flex-wrap:wrap;}
 .cat{background:transparent; border:1px solid var(--line); color:var(--dim);
-  padding:7px 18px; border-radius:3px; font-size:14px; cursor:pointer; font-family:inherit;}
-.cat.on{border-color:var(--text); color:var(--text);}
+  padding:7px 18px; border-radius:999px; font-size:14px; cursor:pointer; font-family:inherit;}
+.cat.on{border-color:var(--ui); color:var(--ui); background:rgba(255,255,255,0.06);}
 .cat.empty{opacity:.45;}
 .cat-note{color:var(--dimmer); font-size:13px; margin:10px 0 22px;}
 
@@ -4011,18 +4114,18 @@ function Styles() {
   font-family:inherit; display:flex; justify-content:space-between; align-items:baseline; gap:12px;
   transition:border-color .12s, background .12s;}
 .item:hover{background:var(--panel2);}
-.item.on{border-left-color:var(--good); background:var(--panel2);}
+.item.on{border-left-color:var(--ui); background:var(--panel2);}
 .item-name{font-size:14.5px;}
 .item-sub{color:var(--dimmer); font-size:12.5px;}
 .preview{width:100%; height:190px; display:block; background:var(--panel); border:1px solid var(--line);}
 .meta{display:flex; gap:18px; margin-top:10px; font-size:12.5px; color:var(--dimmer);}
-.meta .best{color:var(--good);}
+.meta .best{color:var(--ui);}
 
 .dock{display:flex; align-items:center; justify-content:space-between; gap:20px; flex-wrap:wrap;
   border-top:1px solid var(--line); margin-top:26px; padding:16px 0 22px;}
 .dev{display:flex; align-items:center; gap:12px;}
 .dot{width:8px; height:8px; border-radius:50%; background:var(--bad); flex:none;}
-.dot.live{background:var(--good);}
+.dot.live{background:var(--ui);}
 .dev-name{font-size:14px;}
 .dev-sub{font-size:12.5px; color:var(--dimmer);}
 .dock-actions{display:flex; align-items:center; gap:10px;}
@@ -4034,14 +4137,14 @@ function Styles() {
 .cal-body{display:grid; grid-template-columns:1.1fr 1fr; gap:36px;}
 .steps{list-style:none; margin:22px 0 0; padding:0; display:flex; flex-direction:column; gap:2px;}
 .step{display:flex; gap:14px; padding:13px 14px; border-left:2px solid var(--line); background:var(--panel);}
-.step.on{border-left-color:var(--good); background:var(--panel2);}
+.step.on{border-left-color:var(--ui); background:var(--panel2);}
 .step.did{opacity:.55;}
 .step-n{color:var(--dimmer); font-size:13px; width:14px; flex:none;}
 .step-label{font-size:14.5px;}
 .step-help{color:var(--dimmer); font-size:12.5px; margin-top:4px; max-width:44ch;}
 .step-live{font-size:12.5px; margin-top:6px; color:var(--dim);
   font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
-.step-live.ok{color:var(--good);}
+.step-live.ok{color:var(--ui);}
 .cal-actions{display:flex; gap:10px; margin-top:20px;}
 .dev-block{margin-bottom:18px;}
 .dev-head{display:flex; justify-content:space-between; align-items:baseline; gap:12px;
@@ -4050,14 +4153,14 @@ function Styles() {
 .dev-count{font-size:11.5px; color:var(--dimmer);}
 .cal-right{min-width:0;}
 .slider{display:flex; align-items:center; gap:14px; margin-top:10px;}
-.slider input[type=range]{flex:1; accent-color:var(--good); background:transparent;}
+.slider input[type=range]{flex:1; accent-color:var(--ui); background:transparent;}
 .slider .num{font-size:13px; width:56px; text-align:right; color:var(--text);}
 .feel-row{display:grid; grid-template-columns:72px 1fr 50px 76px; align-items:center;
   gap:11px; margin-bottom:9px;}
 .feel-label{font-size:13.5px; color:var(--dim);}
 .feel-track{height:9px; background:var(--panel2); border-radius:5px; position:relative; overflow:hidden;}
 .feel-mid{position:absolute; left:50%; top:0; width:1px; height:100%; background:#2f3634;}
-.feel-fill{position:absolute; top:0; height:100%; background:var(--good); border-radius:5px;}
+.feel-fill{position:absolute; top:0; height:100%; background:var(--ui); border-radius:5px;}
 .feel-val{font-size:13px; text-align:right;}
 .feel-sub{font-size:11.5px; color:var(--dimmer);}
 .tbl.log td,.tbl.log th{padding-right:14px;}
@@ -4068,9 +4171,9 @@ function Styles() {
   align-items:center; margin-bottom:3px;}
 .corner-at{font-size:11.5px; color:var(--dimmer); text-align:right;}
 .corner-name{background:transparent; border:1px solid transparent; color:var(--text);
-  font:inherit; font-size:13.5px; padding:3px 6px; border-radius:3px; min-width:0;}
+  font:inherit; font-size:13.5px; padding:3px 6px; border-radius:8px; min-width:0;}
 .corner-name:hover{border-color:var(--line);}
-.corner-name:focus{border-color:var(--good); background:var(--panel2); outline:none;}
+.corner-name:focus{border-color:var(--ui); background:var(--panel2); outline:none;}
 .corner-peak{font-size:12px; color:var(--dim); text-align:right;}
 .corner-sp{font-size:11.5px; color:var(--dimmer); text-align:right;}
 .perf{font-size:12px; color:var(--dimmer);}
@@ -4082,9 +4185,9 @@ function Styles() {
 .axis-n{color:var(--dimmer); font-size:12px;}
 .axis-bar{height:5px; background:var(--panel2); position:relative; border-radius:3px;}
 .axis-fill{position:absolute; top:-2px; width:3px; height:9px; background:var(--dim); border-radius:2px; transform:translateX(-1px);}
-.axis.mapped .axis-fill{background:var(--good);}
+.axis.mapped .axis-fill{background:var(--ui);}
 .axis-v{font-size:12px; color:var(--dim); text-align:right;}
-.axis-role{font-size:11.5px; color:var(--good);}
+.axis-role{font-size:11.5px; color:var(--ui);}
 
 /* run */
 .run{height:100vh; display:flex; flex-direction:column; background:var(--bg); position:relative;}
@@ -4092,7 +4195,7 @@ function Styles() {
 .run-label{color:var(--dim); font-size:14px;}
 .run-stats{display:flex; gap:28px; align-items:baseline;}
 .big{font-size:26px; font-weight:600;}
-.big.live{color:var(--good);}
+.big.live{color:var(--ui);}
 .unit{font-size:12px; color:var(--dimmer); margin-left:4px; font-weight:400;}
 .run-canvas{flex:1; min-height:0; padding:0 22px;}
 .run-canvas canvas{width:100%; height:100%; display:block;}
@@ -4109,12 +4212,12 @@ function Styles() {
 .score{display:flex; flex-direction:column;}
 .score-num{font-size:92px; font-weight:600; line-height:.92; letter-spacing:-0.04em;}
 .score-of{color:var(--dimmer); font-size:13px; margin-top:8px;}
-.pb{color:var(--good); font-size:13px; margin-top:6px;}
+.pb{color:var(--ui); font-size:13px; margin-top:6px;}
 .bars{display:flex; flex-direction:column; gap:10px; max-width:640px;}
 .bar-row{display:grid; grid-template-columns:74px 1fr 36px 90px; align-items:center; gap:12px;}
 .bar-name{font-size:14px; color:var(--dim);}
 .bar{height:6px; background:var(--panel2); border-radius:3px; overflow:hidden;}
-.bar-fill{height:100%; background:var(--good);}
+.bar-fill{height:100%; background:var(--ui);}
 .bar-v{font-size:14px; text-align:right;}
 .bar-w{font-size:11.5px; color:var(--dimmer);}
 
@@ -4137,10 +4240,24 @@ function Styles() {
 .tbl .dim{color:var(--dimmer);}
 
 .preview-note{border:1px solid var(--line); border-left:2px solid var(--warn);
-  border-radius:6px; background:var(--panel); padding:16px 18px; margin:4px 0 8px;}
+  border-radius:16px; background:var(--panel); padding:16px 18px; margin:4px 0 8px;}
 .preview-note p{margin:0 0 10px; color:var(--dim); font-size:14px; text-align:center;}
 .preview-note a{display:block; text-decoration:none;}
 .preview-note .fine{margin:10px 0 0;}
+
+/* the flowing traces behind the front door */
+.signin.hero{position:relative; overflow:hidden;}
+.trace-field{position:absolute; inset:0; width:100%; height:100%; display:block;
+  pointer-events:none; z-index:0;
+  -webkit-mask-image:radial-gradient(130% 95% at 50% 58%, #000 38%, transparent 82%);
+  mask-image:radial-gradient(130% 95% at 50% 58%, #000 38%, transparent 82%);}
+.signin.hero .signin-inner{position:relative; z-index:1;}
+.vcaso-logo.big{height:38px; margin:0 auto 32px;}
+/* The card sits over a moving background, so it needs to be opaque enough
+   to read against a trace passing underneath it. */
+.signin.hero .card-form{background:rgba(8,8,8,0.92); backdrop-filter:blur(6px);
+  -webkit-backdrop-filter:blur(6px);}
+@media (max-width:520px){ .vcaso-logo.big{height:30px; margin-bottom:26px;} }
 
 /* accounts, requests and the board */
 .topbar{display:flex; align-items:center; justify-content:space-between; gap:16px;
@@ -4149,7 +4266,7 @@ function Styles() {
 .signin-inner.narrow{max-width:380px;}
 .muted{color:var(--dim);}
 .login{min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px;}
-.card-form{display:grid; gap:12px; border:1px solid var(--line); border-radius:6px;
+.card-form{display:grid; gap:12px; border:1px solid var(--line); border-radius:16px;
   background:var(--panel); padding:18px; margin-top:4px;}
 .lbl{display:grid; gap:5px; font-size:13px; color:var(--dim);}
 .lbl.tight{gap:3px; font-size:12px;}
@@ -4159,30 +4276,30 @@ function Styles() {
   font-size:13px; cursor:pointer; text-decoration:underline; text-underline-offset:3px;
   text-decoration-color:var(--line);}
 .link:hover{color:var(--text); text-decoration-color:var(--dim);}
-.panelbox{border:1px solid var(--line); border-radius:6px; background:var(--panel);
+.panelbox{border:1px solid var(--line); border-radius:16px; background:var(--panel);
   padding:18px; margin-bottom:16px; max-width:660px;}
 .big-name{font-size:21px; font-weight:600; letter-spacing:-0.01em; margin:0 0 6px;}
 .big-check{font-size:14.5px; color:var(--text);}
 .inline-form{display:flex; gap:8px; align-items:center; max-width:460px;}
 .inline-form .field{flex:1;}
-.ok-note{color:var(--good); font-size:13px; margin:10px 0 0;}
-.issued{background:var(--bg); border:1px solid var(--line); border-radius:4px;
+.ok-note{color:var(--ui); font-size:13px; margin:10px 0 0;}
+.issued{background:var(--bg); border:1px solid var(--line); border-radius:12px;
   padding:14px; font-size:13px; line-height:1.6; white-space:pre-wrap; word-break:break-word;
   color:var(--text); margin:0 0 16px; max-width:52ch;}
-.field.sm{padding:5px 9px; font-size:13px; width:132px;}
+.field.sm{padding:6px 12px; font-size:13px; width:132px; border-radius:999px;}
 
 .reqs{list-style:none; margin:0 0 8px; padding:0; display:flex; flex-direction:column; gap:8px;}
 .req{display:flex; justify-content:space-between; align-items:flex-start; gap:22px;
   flex-wrap:wrap; border:1px solid var(--line); border-left:2px solid var(--warn);
-  border-radius:4px; background:var(--panel); padding:15px 17px;}
+  border-radius:14px; background:var(--panel); padding:15px 17px;}
 .req-main{display:flex; flex-direction:column; gap:3px; min-width:0;}
 .req-name{font-size:16px; font-weight:600;}
-.req-contact{font-size:13.5px; color:var(--good);}
+.req-contact{font-size:13.5px; color:var(--ui);}
 .req-note{color:var(--dim); font-size:13.5px; margin:5px 0 0; max-width:54ch;}
 .req-act{display:flex; align-items:flex-end; gap:8px; flex-wrap:wrap;}
 
 .tbl.board td{padding:10px 0;}
-.tbl.board tr.me td{color:var(--good);}
+.tbl.board tr.me td{color:var(--ui); font-weight:600;}
 .tbl .dim{color:var(--dimmer);}
 
 @media (max-width:620px){
