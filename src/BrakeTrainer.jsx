@@ -2050,10 +2050,15 @@ function TraceField() {
 
     /* band is the share of the height this layer lives in, bottom-anchored,
        so a trace rises out of its own baseline the way the real one does. */
+    /* span is how many seconds of the lap fit across the width. It wants to
+       be most of a lap: at fifteen seconds each braking event is the size of
+       a building and the whole thing reads as a skyline rather than as
+       telemetry. Near a full lap and you get the real rhythm of a circuit
+       going past — the quick jabs, the long heavy stops, the straights. */
     const layers = [
-      { ch: "brake",    span: 15, speed: 1.00, alpha: 0.85, width: 2.0, band: [0.46, 0.93], fill: 0.055, off: 0 },
-      { ch: "brake",    span: 23, speed: 0.58, alpha: 0.26, width: 1.5, band: [0.26, 0.70], fill: 0,     off: 41 },
-      { ch: "throttle", span: 34, speed: 0.34, alpha: 0.12, width: 1.3, band: [0.08, 0.52], fill: 0,     off: 83 },
+      { ch: "brake",    span: 58, speed: 1.00, alpha: 0.50, width: 1.8, band: [0.56, 0.88], fill: 0.035, off: 0 },
+      { ch: "brake",    span: 76, speed: 0.60, alpha: 0.20, width: 1.4, band: [0.33, 0.62], fill: 0,     off: 41 },
+      { ch: "throttle", span: 95, speed: 0.36, alpha: 0.10, width: 1.2, band: [0.12, 0.44], fill: 0,     off: 83 },
     ];
 
     const draw = () => {
@@ -2070,8 +2075,12 @@ function TraceField() {
       for (const L of layers) {
         const bot = H * L.band[1];
         const h = bot - H * L.band[0];
+        /* Hold the shapes at a readable width rather than a fixed number of
+           seconds. On a phone a full lap squeezed into 390px is a comb; this
+           keeps a braking event about as wide as it is on a laptop. */
+        const span = L.span * Math.min(1, Math.max(0.34, W / 980));
         const at = (i) => {
-          const tt = (t * L.speed + L.off + (i / W) * L.span) % lap.dur;
+          const tt = (t * L.speed + L.off + (i / W) * span) % lap.dur;
           return bot - (lap[L.ch][idx(tt)] ?? 0) * h;
         };
 
@@ -4249,15 +4258,29 @@ function Styles() {
 .signin.hero{position:relative; overflow:hidden;}
 .trace-field{position:absolute; inset:0; width:100%; height:100%; display:block;
   pointer-events:none; z-index:0;
-  -webkit-mask-image:radial-gradient(130% 95% at 50% 58%, #000 38%, transparent 82%);
-  mask-image:radial-gradient(130% 95% at 50% 58%, #000 38%, transparent 82%);}
+  /* In a mask, opaque shows and transparent hides. The middle is where the
+     logo, the form and the small print live, so that is the part to hide;
+     the traces run out to the edges where there is nothing to read. */
+  -webkit-mask-image:radial-gradient(ellipse 62% 52% at 50% 46%,
+    transparent 22%, rgba(0,0,0,0.5) 64%, #000 100%);
+  mask-image:radial-gradient(ellipse 62% 52% at 50% 46%,
+    transparent 22%, rgba(0,0,0,0.5) 64%, #000 100%);}
 .signin.hero .signin-inner{position:relative; z-index:1;}
 .vcaso-logo.big{height:38px; margin:0 auto 32px;}
 /* The card sits over a moving background, so it needs to be opaque enough
    to read against a trace passing underneath it. */
 .signin.hero .card-form{background:rgba(8,8,8,0.92); backdrop-filter:blur(6px);
   -webkit-backdrop-filter:blur(6px);}
-@media (max-width:520px){ .vcaso-logo.big{height:30px; margin-bottom:26px;} }
+@media (max-width:620px){
+  .vcaso-logo.big{height:30px; margin-bottom:26px;}
+  /* A phone is tall and narrow, so the small print below the card falls
+     outside an ellipse sized for a laptop. Protect more of the middle. */
+  .trace-field{opacity:.7;
+    -webkit-mask-image:radial-gradient(ellipse 92% 64% at 50% 50%,
+      transparent 34%, rgba(0,0,0,0.42) 74%, #000 100%);
+    mask-image:radial-gradient(ellipse 92% 64% at 50% 50%,
+      transparent 34%, rgba(0,0,0,0.42) 74%, #000 100%);}
+}
 
 /* accounts, requests and the board */
 .topbar{display:flex; align-items:center; justify-content:space-between; gap:16px;
