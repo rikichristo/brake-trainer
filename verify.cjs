@@ -48,6 +48,7 @@ function makeStub(world) {
     async signInWithPassword({ email, password }) {
       calls.push(`signIn ${email}`);
       const u = world.users[email];
+      if (u && u.throwNetwork) throw new TypeError("Load failed");
       if (!u || u.password !== password) {
         return { data: {}, error: { message: "Invalid login credentials" } };
       }
@@ -84,7 +85,7 @@ function mount(world, opts = {}) {
   const dom = new JSDOM(HTML, {
     runScripts: "dangerously",
     pretendToBeVisual: true,
-    url: "https://rikichristo.github.io/brake-trainer/",
+    url: opts.url || "https://rikichristo.github.io/brake-trainer/",
     beforeParse(w) {
       Object.defineProperty(w, "performance", { value: nodePerf, configurable: true });
       w.ResizeObserver = class { observe() {} disconnect() {} };
@@ -330,7 +331,46 @@ async function run() {
     dom.window.close();
   }
 
-  /* 7. Brake only. */
+  /* 7. Opened from the claude.ai preview, which cannot reach the server.
+        This is what Riki actually hit, and "Load failed" told him nothing. */
+  console.log("\n— opened from a preview copy —");
+  {
+    const { dom, errs } = mount(world({ signedIn: false }),
+      { url: "https://abc123.artifacts.claude.ai/index.html" });
+    await wait(900);
+    const t = txt(dom);
+    check("says it is a preview", t.includes("preview copy"), true);
+    check("gives the real link",
+      !!dom.window.document.getElementById("root")
+        .querySelector('a[href="https://rikichristo.github.io/brake-trainer/"]'), true);
+    check("does not offer a password box that cannot work",
+      !dom.window.document.getElementById("root").querySelector('input[type="password"]'), true);
+    check("still offers local training", !!findBtn(dom, "without an account"), true);
+    check("no page errors", errs.length ? errs.join("; ") : "none", "none");
+    dom.window.close();
+  }
+
+  /* 8. A dropped connection on the real site reads as English, not TypeError. */
+  console.log("\n— server unreachable on the real site —");
+  {
+    const w = world({ signedIn: false });
+    w.users["reza@drivers.rikichristo.com"].throwNetwork = true;
+    const { dom, errs } = mount(w);
+    await wait(900);
+    await type(dom, "e.g. reza", "reza");
+    const pw = dom.window.document.getElementById("root").querySelectorAll('input[type="password"]')[0];
+    const set = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value").set;
+    set.call(pw, "secret12");
+    pw.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+    await submit(dom);
+    const t = txt(dom);
+    check("no raw TypeError shown", /Load failed|Failed to fetch/.test(t), false);
+    check("plain-English failure", t.includes("Could not reach the server"), true);
+    check("no page errors", errs.length ? errs.join("; ") : "none", "none");
+    dom.window.close();
+  }
+
+  /* 9. Brake only. */
   console.log("\n— brake only —");
   {
     const { dom, errs } = mount(world({}));

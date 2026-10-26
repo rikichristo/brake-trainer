@@ -67,6 +67,35 @@ const idx = (t) => Math.round(t * HZ);
    to the local profiles it has always had. A sim rig in a garage with no
    connection must still be able to run a drill.
    ------------------------------------------------------------ */
+/* Where the real thing lives. A copy of this page opened from anywhere else
+   — a claude.ai artifact preview, a file on the desktop — is sandboxed or has
+   the wrong origin, so it cannot reach the server at all. That is not a fault
+   to report as an error; it is a fact to say plainly, with the right link. */
+const LIVE_URL = "https://rikichristo.github.io/brake-trainer/";
+const LIVE_HOST = "rikichristo.github.io";
+
+function previewOnly() {
+  if (typeof location === "undefined") return false;
+  const h = location.hostname;
+  if (!h) return true;                                  // opened as a file
+  if (h === LIVE_HOST) return false;
+  if (h === "localhost" || h === "127.0.0.1") return false;
+  return true;
+}
+
+/* A browser reports a blocked or dropped request as a bare TypeError —
+   "Load failed" in Safari, "Failed to fetch" in Chrome. Shown raw that reads
+   like a bug in the app, and tells the driver nothing they can act on. */
+const netMessage = (e) => {
+  const m = String((e && e.message) || e || "");
+  if (/load failed|failed to fetch|networkerror|network ?request ?failed|ERR_/i.test(m)) {
+    return previewOnly()
+      ? `This is a preview copy and it cannot reach the server. Open ${LIVE_URL} and sign in there.`
+      : "Could not reach the server. Check your connection and try again.";
+  }
+  return m;
+};
+
 const SUPA_URL = "https://bqvygaqvwmakbrxnllws.supabase.co";
 const SUPA_KEY = "sb_publishable_M8zD44AbCWO1rjBdWVbGJA_lfRLKvwz";
 const DRIVER_DOMAIN = "drivers.rikichristo.com";
@@ -1990,7 +2019,8 @@ function SignIn({ onSignedIn, onLocal }) {
   const [err, setErr] = useState("");
   const [asking, setAsking] = useState(false);
 
-  const offline = !cloud.ready();
+  const preview = previewOnly();
+  const offline = !cloud.ready() || preview;
 
   const submit = async (e) => {
     e.preventDefault();
@@ -2005,7 +2035,7 @@ function SignIn({ onSignedIn, onLocal }) {
       const m = String(e2?.message || e2);
       setErr(/invalid login|credentials/i.test(m)
         ? "That username or password didn't match. Try again."
-        : m);
+        : netMessage(e2));
       setBusy(false);
     }
   };
@@ -2018,10 +2048,24 @@ function SignIn({ onSignedIn, onLocal }) {
         <img src={VCASO_LOGO} alt="VCASO Performance" className="vcaso-logo" />
         <h1 className="h1 centre">Brake Trainer</h1>
         <p className="lede centre">
-          {offline
-            ? "This machine is offline, so signing in is unavailable. You can still train with a local profile."
-            : "Sign in with the username and password Riki gave you."}
+          {preview
+            ? "This is a preview copy, so it cannot sign you in or reach the leaderboard."
+            : offline
+              ? "This machine is offline, so signing in is unavailable. You can still train with a local profile."
+              : "Sign in with the username and password Riki gave you."}
         </p>
+
+        {preview && (
+          <div className="preview-note">
+            <p>The real thing is here:</p>
+            <a className="btn primary wide" href={LIVE_URL} target="_blank" rel="noreferrer">
+              Open the Brake Trainer
+            </a>
+            <p className="fine centre">
+              Worth bookmarking — pedals only work there too.
+            </p>
+          </div>
+        )}
 
         {!offline && (
           <form onSubmit={submit} className="card-form">
@@ -2080,7 +2124,7 @@ function RequestAccess({ onBack }) {
         note: f.note.trim(),
       });
       setSent(true);
-    } catch (e2) { setErr(String(e2?.message || e2)); setBusy(false); }
+    } catch (e2) { setErr(netMessage(e2)); setBusy(false); }
   };
 
   if (sent) {
@@ -4091,6 +4135,12 @@ function Styles() {
 .tbl td:first-child{text-align:left;}
 .z-name{color:var(--text);}
 .tbl .dim{color:var(--dimmer);}
+
+.preview-note{border:1px solid var(--line); border-left:2px solid var(--warn);
+  border-radius:6px; background:var(--panel); padding:16px 18px; margin:4px 0 8px;}
+.preview-note p{margin:0 0 10px; color:var(--dim); font-size:14px; text-align:center;}
+.preview-note a{display:block; text-decoration:none;}
+.preview-note .fine{margin:10px 0 0;}
 
 /* accounts, requests and the board */
 .topbar{display:flex; align-items:center; justify-content:space-between; gap:16px;
