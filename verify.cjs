@@ -426,7 +426,31 @@ async function run() {
     dom.window.close();
   }
 
-  /* 10. Brake only. */
+  /* 10. The logo is the way home from every screen. */
+  console.log("\n— logo as a home button —");
+  {
+    const { dom, errs } = mount(world({ role: "coach" }));
+    await wait(1000);
+    const root = dom.window.document.getElementById("root");
+    check("garage shows the mark, not a button",
+      !!root.querySelector("img.vcaso-logo") && !root.querySelector("button.masthead"), true);
+
+    for (const where of ["Leaderboard", "Account", "Requests", "Logbook"]) {
+      await click(dom, where);
+      const mast = dom.window.document.getElementById("root").querySelector("button.masthead");
+      check(`${where} carries a clickable mark`, !!mast, true);
+      if (mast) {
+        mast.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
+        await wait(220);
+        check(`${where} → mark returns to the garage`,
+          txt(dom).includes("Run session"), true);
+      }
+    }
+    check("no page errors", errs.length ? errs.join("; ") : "none", "none");
+    dom.window.close();
+  }
+
+  /* 11. Brake only. */
   console.log("\n— brake only —");
   {
     const { dom, errs } = mount(world({}));

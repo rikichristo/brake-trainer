@@ -1981,6 +1981,8 @@ export default function BrakeTrainer() {
     }
   }, [fullLap?.id, notes]);
 
+  const goHome = useCallback(() => setScreen("garage"), []);
+
   const leaveAccount = useCallback(async () => {
     await cloud.signOut();
     setAccount(null); setDriver(null); setResult(null); setSyncNote("");
@@ -2007,7 +2009,7 @@ export default function BrakeTrainer() {
           }} />
       )}
       {screen === "account" && (
-        <Account account={account}
+        <Account account={account} onHome={goHome}
           onLeaderboard={async (on) => {
             setAccount((a) => ({ ...a, on_leaderboard: on }));
             try { await cloud.setOnLeaderboard(on); }
@@ -2018,9 +2020,9 @@ export default function BrakeTrainer() {
           }}
           onSignOut={leaveAccount} onBack={() => setScreen("garage")} />
       )}
-      {screen === "requests" && <Requests onBack={() => setScreen("garage")} />}
+      {screen === "requests" && <Requests onBack={goHome} onHome={goHome} />}
       {screen === "board" && (
-        <Leaderboard lapKey={`${fullLap.id}:${drill.id}`} lapLabel={label}
+        <Leaderboard lapKey={`${fullLap.id}:${drill.id}`} lapLabel={label} onHome={goHome}
           onBack={() => setScreen("garage")} />
       )}
       {screen === "garage" && (
@@ -2062,19 +2064,20 @@ export default function BrakeTrainer() {
         />
       )}
       {screen === "logbook" && (
-        <Logbook driver={driver}
+        <Logbook driver={driver} onHome={goHome}
           onOpen={(rec) => { setViewing(rec); setScreen("saved"); }}
           onBack={() => setScreen("garage")} />
       )}
       {screen === "saved" && viewing && (
-        <SavedRun rec={viewing} onBack={() => setScreen("logbook")} />
+        <SavedRun rec={viewing} onBack={() => setScreen("logbook")} onHome={goHome} />
       )}
       {screen === "feel" && (
-        <Feel cal={cal} feel={feel} setFeel={saveFeel} keyboard={keyboard}
+        <Feel cal={cal} feel={feel} setFeel={saveFeel} keyboard={keyboard} onHome={goHome}
           onDone={() => setScreen("garage")} />
       )}
       {screen === "calibrate" && (
-        <Calibrate cal={cal} onSave={(c) => { saveCal(c); setScreen("garage"); }} onCancel={() => setScreen("garage")} />
+        <Calibrate cal={cal} onSave={(c) => { saveCal(c); setScreen("garage"); }}
+          onCancel={goHome} onHome={goHome} />
       )}
       {screen === "run" && (
         <Run lap={lap} cal={cal} keyboard={keyboard} feel={feel} label={label}
@@ -2082,7 +2085,7 @@ export default function BrakeTrainer() {
           onFinish={finish} onAbort={() => setScreen("garage")} />
       )}
       {screen === "results" && result && (
-        <Results r={result} best={bests[bestKey]} saved={result.saved}
+        <Results r={result} best={bests[bestKey]} saved={result.saved} onHome={goHome}
           notes={showNotes ? notes : null}
           onRetry={() => setScreen("run")} onGarage={() => setScreen("garage")} />
       )}
@@ -2383,7 +2386,7 @@ function Waiting({ account, onRecheck, onSignOut }) {
 }
 
 /* ---------------- Account ---------------- */
-function Account({ account, onLeaderboard, onSignOut, onBack }) {
+function Account({ account, onLeaderboard, onSignOut, onBack, onHome }) {
   const [pw, setPw] = useState("");
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
@@ -2402,6 +2405,7 @@ function Account({ account, onLeaderboard, onSignOut, onBack }) {
 
   return (
     <div className="cal">
+      <Masthead onHome={onHome} />
       <div className="topbar">
         <h1 className="wordmark sm">Account</h1>
         <button className="btn sm" onClick={onBack}>Back to garage</button>
@@ -2459,7 +2463,7 @@ function Account({ account, onLeaderboard, onSignOut, onBack }) {
    Approving creates the login server-side and hands back a password once.
    It is never stored in readable form, so if this screen is closed before
    it is copied, the only way back is to issue a new one. */
-function Requests({ onBack }) {
+function Requests({ onBack, onHome }) {
   const [rows, setRows] = useState(null);
   const [drivers, setDrivers] = useState([]);
   const [err, setErr] = useState("");
@@ -2530,6 +2534,7 @@ function Requests({ onBack }) {
       "Change the password once you are in, under Account.";
     return (
       <div className="cal">
+        <Masthead onHome={onHome} />
         <div className="topbar">
           <h1 className="wordmark sm">{issued.reissued ? "New password" : "Approved"}</h1>
           <button className="btn sm" onClick={() => setIssued(null)}>Back to the list</button>
@@ -2560,6 +2565,7 @@ function Requests({ onBack }) {
 
   return (
     <div className="cal">
+      <Masthead onHome={onHome} />
       <div className="topbar">
         <h1 className="wordmark sm">Access requests</h1>
         <div className="dock-actions">
@@ -2656,7 +2662,7 @@ function Requests({ onBack }) {
 }
 
 /* ---------------- Leaderboard ---------------- */
-function Leaderboard({ lapKey, lapLabel, onBack }) {
+function Leaderboard({ lapKey, lapLabel, onBack, onHome }) {
   const [tab, setTab] = useState("lap");
   const [lapRows, setLapRows] = useState(null);
   const [allRows, setAllRows] = useState(null);
@@ -2680,6 +2686,7 @@ function Leaderboard({ lapKey, lapLabel, onBack }) {
 
   return (
     <div className="cal">
+      <Masthead onHome={onHome} />
       <div className="topbar">
         <h1 className="wordmark sm">Leaderboard</h1>
         <button className="btn sm" onClick={onBack}>Back to garage</button>
@@ -2939,6 +2946,23 @@ function CornerNote({ zoneN, name, body, isCoach, onSave, overview = false }) {
   );
 }
 
+/* The mark at the top of every screen, and the way back to the garage.
+   Riki kept pressing it and nothing happened, which is the right instinct:
+   a logo at the top of an app is a home button nearly everywhere else, so
+   it should be one here. On the garage itself there is nowhere to go, so it
+   renders as a plain image rather than a button that does nothing when
+   pressed — a control that looks live and is not is worse than no control. */
+function Masthead({ onHome = null }) {
+  const mark = <img src={VCASO_LOGO} alt="VCASO Performance" className="vcaso-logo top" />;
+  if (!onHome) return mark;
+  return (
+    <button className="masthead" onClick={onHome}
+      title="Back to the garage" aria-label="Back to the garage">
+      {mark}
+    </button>
+  );
+}
+
 /* ---------------- Garage ---------------- */
 function Garage({
   driver, account, syncNote, onSwitchDriver, cat, setCat, all, lapId, setLapId, fullLap,
@@ -3008,7 +3032,7 @@ function Garage({
 
   return (
     <div className="garage">
-      <img src={VCASO_LOGO} alt="VCASO Performance" className="vcaso-logo top" />
+      <Masthead />
       <header className="top">
         <span className="wordmark sm">Brake Trainer</span>
         <div className="dock-actions">
@@ -3231,7 +3255,7 @@ function TracePreview({ lap }) {
 /* ---------------- Feel ----------------
    Tuning the rig against the reference, with the controls live so a change
    can be judged by hand rather than by number. */
-function Feel({ cal, feel, setFeel, keyboard, onDone }) {
+function Feel({ cal, feel, setFeel, keyboard, onDone, onHome }) {
   const read = useInputDevice(cal, keyboard, feel);
   const [v, setV] = useState({ brake: 0, throttle: 0, steer: 0 });
   const [raw, setRaw] = useState({ steer: 0, brake: 0 });
@@ -3268,6 +3292,7 @@ function Feel({ cal, feel, setFeel, keyboard, onDone }) {
 
   return (
     <div className="cal">
+      <Masthead onHome={onHome} />
       <header className="top">
         <span className="wordmark sm">Feel</span>
         <button className="btn primary sm" onClick={onDone}>Done</button>
@@ -3386,7 +3411,7 @@ const isAnalog = (v) => Number.isFinite(v) && Math.abs(v) <= 1.05;
 const shortId = (id) => (id || "").replace(/\s*\((Vendor|STANDARD).*$/i, "").trim().slice(0, 44) || "Unnamed device";
 const ROLE_LABEL = { brake: "brake", throttle: "throttle", steer: "steering" };
 
-function Calibrate({ cal, onSave, onCancel }) {
+function Calibrate({ cal, onSave, onCancel, onHome }) {
   const [step, setStep] = useState(0);
   const [rest, setRest] = useState(null);
   const [draft, setDraft] = useState(BLANK_CAL);
@@ -3513,6 +3538,7 @@ function Calibrate({ cal, onSave, onCancel }) {
 
   return (
     <div className="cal">
+      <Masthead onHome={onHome} />
       <header className="top">
         <span className="wordmark sm">Link your pedals</span>
         <button className="btn ghost sm" onClick={onCancel}>Back</button>
@@ -3943,7 +3969,7 @@ function Run({ lap, cal, keyboard, feel, label, brakeOnly = false, notes = null,
 }
 
 /* ---------------- Logbook ---------------- */
-function Logbook({ driver, onOpen, onBack }) {
+function Logbook({ driver, onOpen, onBack, onHome }) {
   const [index, setIndex] = useState(() => loadRunIndex());
   const [who, setWho] = useState(driver?.name ?? "all");
   const [err, setErr] = useState("");
@@ -3985,6 +4011,7 @@ function Logbook({ driver, onOpen, onBack }) {
 
   return (
     <div className="results">
+      <Masthead onHome={onHome} />
       <header className="top">
         <span className="wordmark sm">Logbook</span>
         <div className="dock-actions">
@@ -4059,7 +4086,7 @@ function Logbook({ driver, onOpen, onBack }) {
 
 /* A saved run, reopened. The traces come back from the file rather than from
    a session that just happened, so this is a read-only view of the record. */
-function SavedRun({ rec, onBack }) {
+function SavedRun({ rec, onBack, onHome }) {
   const lap = useMemo(() => ({
     n: rec.n, dur: rec.dur,
     brake: decodeU8(rec.ref.brake, 0, 1),
@@ -4083,7 +4110,7 @@ function SavedRun({ rec, onBack }) {
 }
 
 /* ---------------- Results ---------------- */
-function Results({ r, best, saved, notes = null, onRetry, onGarage }) {
+function Results({ r, best, saved, notes = null, onRetry, onGarage, onHome }) {
   const cvs = useRef(null);
 
   useEffect(() => {
@@ -4123,6 +4150,7 @@ function Results({ r, best, saved, notes = null, onRetry, onGarage }) {
 
   return (
     <div className="results">
+      <Masthead onHome={onHome} />
       <header className="top">
         <span className="wordmark sm">{r.label}</span>
         <div className="dock-actions">
@@ -4467,6 +4495,11 @@ header.top{display:flex; align-items:center; justify-content:space-between; gap:
   .display-name{font-size:14px; letter-spacing:.09em;}
   .trace-strip{height:54px; margin-bottom:20px;}
 }
+
+.masthead{display:block; width:100%; background:none; border:none; padding:0;
+  cursor:pointer; font:inherit;}
+.masthead .vcaso-logo{transition:opacity .12s;}
+.masthead:hover .vcaso-logo,.masthead:focus-visible .vcaso-logo{opacity:.65;}
 
 /* the coach's walk-through */
 .corner-note{margin:0 0 8px;}
