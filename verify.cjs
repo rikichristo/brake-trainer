@@ -180,6 +180,12 @@ function world({ role = "driver", approved = true, signedIn = true, pending = []
       if (state.table === "bt_settings") {
         return { data: { data: { feel: { brakeRange: 1.43 }, bests: {}, brakeOnly: false } }, error: null };
       }
+      if (state.table === "bt_coach_notes") {
+        return { data: [
+          { zone_n: 0, body: "Overview: this lap rewards patience on entry.", updated_at: null },
+          { zone_n: 1, body: "T1 - big hit and hold, bleed off smoothly, keep it calm.", updated_at: null },
+        ], error: null };
+      }
       if (state.table === "bt_runs") return { data: [], error: null };
       return { data: null, error: null };
     },
@@ -370,7 +376,57 @@ async function run() {
     dom.window.close();
   }
 
-  /* 9. Brake only. */
+  /* 9. The coach's walk-through, from both sides. */
+  console.log("\n— coach notes, as the coach —");
+  {
+    const w = world({ role: "coach" });
+    const { dom, errs } = mount(w);
+    await wait(1100);
+    const t = txt(dom);
+    check("existing note shown", t.includes("big hit and hold"), true);
+    check("lap overview shown", t.includes("Overview: this lap rewards"), true);
+    check("offers to add one where there is none", /Add a note for/.test(t), true);
+    check("notes switch in the garage",
+      [...dom.window.document.getElementById("root").querySelectorAll('input[type="checkbox"]')]
+        .some((i) => i.closest("label") && i.closest("label").textContent.includes("Coach notes")), true);
+
+    // write one
+    const add = findBtn(dom, "Add a note for");
+    add.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
+    await wait(150);
+    const ta = dom.window.document.getElementById("root").querySelector("textarea");
+    check("editor opens", !!ta, true);
+    if (ta) {
+      const set = Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, "value").set;
+      ta.focus();
+      set.call(ta, "Brake late, trail to the apex.");
+      ta.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+      await wait(60);
+      // A real blur, so React's focusout handler actually runs.
+      ta.blur();
+      await wait(300);
+    }
+    const saved = w.updated.find((x) => x.table === "bt_coach_notes");
+    check("note reached the server", !!saved, true);
+    check("note body sent", saved && saved.value.body, "Brake late, trail to the apex.");
+    check("no page errors", errs.length ? errs.join("; ") : "none", "none");
+    dom.window.close();
+  }
+
+  console.log("\n— coach notes, as the driver —");
+  {
+    const { dom, errs } = mount(world({}));
+    await wait(1100);
+    const t = txt(dom);
+    const root = dom.window.document.getElementById("root");
+    check("driver reads the note", t.includes("big hit and hold"), true);
+    check("driver gets no editor", !!root.querySelector("textarea"), false);
+    check("driver is not invited to write one", /Add a note for/.test(t), false);
+    check("no page errors", errs.length ? errs.join("; ") : "none", "none");
+    dom.window.close();
+  }
+
+  /* 10. Brake only. */
   console.log("\n— brake only —");
   {
     const { dom, errs } = mount(world({}));

@@ -311,6 +311,35 @@ const cloud = {
     try { return data?.trace ? JSON.parse(data.trace) : null; } catch { return null; }
   },
 
+  /* A coach's corner-by-corner walk-through of one reference lap, keyed by
+     zone number. Zone 0 is the overview shown before the first corner. */
+  async coachNotes(lapId) {
+    const sb = client(); if (!sb || !lapId) return {};
+    const { data, error } = await sb.from("bt_coach_notes")
+      .select("zone_n,body,updated_at").eq("lap_id", lapId);
+    if (error) throw error;
+    const out = {};
+    for (const r of data ?? []) out[r.zone_n] = r.body;
+    return out;
+  },
+
+  async saveCoachNote(lapId, zoneN, body) {
+    const sb = client(); if (!sb) throw new Error("offline");
+    const { data: u } = await sb.auth.getUser();
+    if (!u?.user) throw new Error("Sign in again.");
+    const text = String(body ?? "").trim();
+    if (!text) {
+      const { error } = await sb.from("bt_coach_notes").delete()
+        .eq("lap_id", lapId).eq("zone_n", zoneN).eq("author_id", u.user.id);
+      if (error) throw error;
+      return;
+    }
+    const { error } = await sb.from("bt_coach_notes").upsert({
+      lap_id: lapId, zone_n: zoneN, body: text.slice(0, 1200), author_id: u.user.id,
+    }, { onConflict: "lap_id,zone_n,author_id" });
+    if (error) throw error;
+  },
+
   async board(lapId = null) {
     const sb = client(); if (!sb) return [];
     const { data, error } = await sb.rpc("bt_leaderboard", { p_lap: lapId });
@@ -1776,6 +1805,8 @@ export default function BrakeTrainer() {
   const [cal, setCal] = useState(BLANK_CAL);
   const [feel, setFeel] = useState(BLANK_FEEL);
   const [brakeOnly, setBrakeOnly] = useState(false);
+  const [showNotes, setShowNotes] = useState(true);
+  const [notes, setNotes] = useState({});
   const [viewing, setViewing] = useState(null);
   const [keyboard, setKeyboard] = useState(false);
   const [imported, setImported] = useState(() => loadSavedLapRecords().map(unpackLap));
@@ -1829,6 +1860,7 @@ export default function BrakeTrainer() {
     setFeel({ ...BLANK_FEEL, ...localFeel, ...(remote?.feel ?? {}) });
     setBests({ ...localBests, ...(remote?.bests ?? {}) });
     setBrakeOnly(!!(remote?.brakeOnly ?? store.get(`bt:brakeOnly:${prof.id}`)));
+    setShowNotes(remote?.showNotes !== undefined ? !!remote.showNotes : true);
     /* Calibration only travels if this machine has none of its own; the axes
        on someone else's rig are not the axes on this one. */
     if (remote?.cal && !store.get("bt:cal")) setCal(remote.cal);
@@ -1840,6 +1872,8 @@ export default function BrakeTrainer() {
     setFeel({ ...BLANK_FEEL, ...(store.get(`bt:feel:${driver.id}`) ?? {}) });
     setBests(store.get(`bt:bests:${driver.id}`) ?? {});
     setBrakeOnly(!!store.get(`bt:brakeOnly:${driver.id}`));
+    const sn = store.get(`bt:showNotes:${driver.id}`);
+    setShowNotes(sn === null ? true : !!sn);
   }, [driver]);
 
   /* One place that writes a driver's state to both sides. Local first, since
@@ -1849,14 +1883,16 @@ export default function BrakeTrainer() {
     if (patch.feel !== undefined) store.set(`bt:feel:${driver.id}`, patch.feel);
     if (patch.bests !== undefined) store.set(`bt:bests:${driver.id}`, patch.bests);
     if (patch.brakeOnly !== undefined) store.set(`bt:brakeOnly:${driver.id}`, patch.brakeOnly);
+    if (patch.showNotes !== undefined) store.set(`bt:showNotes:${driver.id}`, patch.showNotes);
     if (!driver.cloud || !cloud.ready()) return;
     cloud.pushSettings({
       feel: patch.feel ?? feel,
       bests: patch.bests ?? bests,
       brakeOnly: patch.brakeOnly ?? brakeOnly,
+      showNotes: patch.showNotes ?? showNotes,
       cal: patch.cal ?? cal,
     }).catch(() => setSyncNote("Your settings are saved on this machine but did not reach the server."));
-  }, [driver, feel, bests, brakeOnly, cal]);
+  }, [driver, feel, bests, brakeOnly, showNotes, cal]);
 
   const all = useMemo(() => [...LAPS, ...imported], [imported]);
   const [nameRev, setNameRev] = useState(0);   // bump to re-read custom names
@@ -1864,6 +1900,18 @@ export default function BrakeTrainer() {
     () => applyZoneNames(all.find((l) => l.id === lapId) ?? all[0]),
     [all, lapId, nameRev]
   );
+  /* The coach's walk-through belongs to the reference lap, not to the drill,
+     so it follows the lap selection and survives switching between corners
+     only and a full lap. */
+  useEffect(() => {
+    if (!driver?.cloud || !cloud.ready() || !fullLap?.id) { setNotes({}); return; }
+    let gone = false;
+    cloud.coachNotes(fullLap.id)
+      .then((n) => { if (!gone) setNotes(n); })
+      .catch(() => { if (!gone) setNotes({}); });
+    return () => { gone = true; };
+  }, [driver, fullLap?.id]);
+
   const drills = useMemo(() => makeDrills(fullLap), [fullLap]);
   const drill = drills.find((d) => d.id === drillId) ?? drills[0];
   const lap = useMemo(() => buildDrill(fullLap, drill), [fullLap, drill]);
@@ -1908,6 +1956,21 @@ export default function BrakeTrainer() {
   const saveCal = (c) => { setCal(c); store.set("bt:cal", c); persist({ cal: c }); };
   const saveFeel = (f) => { setFeel(f); persist({ feel: f }); };
   const saveBrakeOnly = (v) => { setBrakeOnly(v); persist({ brakeOnly: v }); };
+  const saveShowNotes = (v) => { setShowNotes(v); persist({ showNotes: v }); };
+
+  const saveNote = useCallback(async (zoneN, body) => {
+    const before = notes[zoneN];
+    setNotes((p) => {
+      const next = { ...p };
+      if (String(body ?? "").trim()) next[zoneN] = body.trim(); else delete next[zoneN];
+      return next;
+    });
+    try { await cloud.saveCoachNote(fullLap.id, zoneN, body); }
+    catch (e) {
+      setSyncNote(`That note did not save: ${e?.message || e}`);
+      setNotes((p) => ({ ...p, ...(before ? { [zoneN]: before } : {}) }));
+    }
+  }, [fullLap?.id, notes]);
 
   const leaveAccount = useCallback(async () => {
     await cloud.signOut();
@@ -1955,6 +2018,8 @@ export default function BrakeTrainer() {
         <Garage
           driver={driver} account={account} syncNote={syncNote}
           brakeOnly={brakeOnly} setBrakeOnly={saveBrakeOnly}
+          showNotes={showNotes} setShowNotes={saveShowNotes}
+          notes={notes} onSaveNote={saveNote} isCoach={account?.role === "coach"}
           onAccount={driver?.cloud ? () => setScreen("account") : null}
           onRequests={account?.role === "coach" ? () => setScreen("requests") : null}
           onBoard={driver?.cloud ? () => setScreen("board") : null}
@@ -2004,11 +2069,12 @@ export default function BrakeTrainer() {
       )}
       {screen === "run" && (
         <Run lap={lap} cal={cal} keyboard={keyboard} feel={feel} label={label}
-          brakeOnly={brakeOnly}
+          brakeOnly={brakeOnly} notes={showNotes ? notes : null}
           onFinish={finish} onAbort={() => setScreen("garage")} />
       )}
       {screen === "results" && result && (
         <Results r={result} best={bests[bestKey]} saved={result.saved}
+          notes={showNotes ? notes : null}
           onRetry={() => setScreen("run")} onGarage={() => setScreen("garage")} />
       )}
     </div>
@@ -2809,11 +2875,67 @@ function DriverSelect({ onPick, onBack = null }) {
   );
 }
 
+/* One corner's worth of a coach's walk-through.
+   A coach sees an editable field; a driver sees the words, or nothing at all
+   when nothing has been written. Saved on blur rather than behind a button:
+   writing seventeen of these is enough work without a save click each time. */
+function CornerNote({ zoneN, name, body, isCoach, onSave, overview = false }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(body ?? "");
+
+  useEffect(() => { setDraft(body ?? ""); }, [body]);
+
+  if (!isCoach) {
+    if (!body) return null;
+    return (
+      <p className={`corner-note read ${overview ? "overview" : ""}`}>
+        {overview && <span className="corner-note-label">Before the lap</span>}
+        {body}
+      </p>
+    );
+  }
+
+  if (!editing) {
+    return body ? (
+      <p className={`corner-note read editable ${overview ? "overview" : ""}`}
+         onClick={() => setEditing(true)}
+         title="Click to edit">
+        {overview && <span className="corner-note-label">Before the lap</span>}
+        {body}
+      </p>
+    ) : (
+      <button className="corner-note add" onClick={() => setEditing(true)}>
+        {overview ? "Add a note for the whole lap" : `Add a note for ${name || "this corner"}`}
+      </button>
+    );
+  }
+
+  return (
+    <div className="corner-note edit">
+      <textarea
+        className="field" rows={overview ? 3 : 2} autoFocus maxLength={1200}
+        value={draft}
+        placeholder={overview
+          ? "What should they have in their head before they start?"
+          : "What is the job in this corner?"}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => { setEditing(false); if (draft !== (body ?? "")) onSave(zoneN, draft); }}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") { setDraft(body ?? ""); setEditing(false); }
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) e.target.blur();
+        }}
+      />
+      <span className="fine">Click away to save · Esc to cancel</span>
+    </div>
+  );
+}
+
 /* ---------------- Garage ---------------- */
 function Garage({
   driver, account, syncNote, onSwitchDriver, cat, setCat, all, lapId, setLapId, fullLap,
   drills, drillId, setDrillId, lap, cal, keyboard, setKeyboard, best, onImport, lapWarn,
-  onDeleteLap, brakeOnly, setBrakeOnly, onCalibrate, onFeel, onLogbook, onRenameZone,
+  onDeleteLap, brakeOnly, setBrakeOnly, showNotes, setShowNotes, notes, onSaveNote,
+  isCoach, onCalibrate, onFeel, onLogbook, onRenameZone,
   onAccount, onRequests, onBoard, onStart,
 }) {
   const [pending, setPending] = useState(0);
@@ -2914,7 +3036,7 @@ function Garage({
       <p className="cat-note">{CATEGORIES[cat].note}</p>
 
       {lapList.length === 0 ? (
-        <div className="empty">
+        <div className="empty-state">
           <h2 className="h1">No laps in this class yet</h2>
           <p className="lede">
             Drive a session in an {CATEGORIES[cat].name} car and export the telemetry,
@@ -2991,18 +3113,27 @@ function Garage({
             <div className="corners">
               <p className="fine" style={{ margin: "14px 0 8px" }}>
                 Braking zones, in lap order. Rename any that are wrong — the name sticks.
+                {isCoach && " Add a note to any corner and your drivers will see it as they reach it."}
               </p>
+              <CornerNote
+                zoneN={0} name="Before the lap" isCoach={isCoach}
+                body={notes?.[0]} onSave={onSaveNote} overview />
               {fullLap.zones.map((z, i) => (
-                <div className="corner-row" key={i}>
-                  <span className="corner-at num">{z.at}m</span>
-                  <input
-                    className="corner-name" defaultValue={z.name}
-                    id={`zone-${fullLap.id}-${i}`}
-                    onBlur={(e) => { if (e.target.value !== z.name) onRenameZone(i, e.target.value); }}
-                    onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); }}
-                  />
-                  <span className="corner-peak num">{Math.round(z.peak * 100)}%</span>
-                  <span className="corner-sp num">{z.speedIn}&rarr;{z.speedMin}</span>
+                <div key={i}>
+                  <div className="corner-row">
+                    <span className="corner-at num">{z.at}m</span>
+                    <input
+                      className="corner-name" defaultValue={z.name}
+                      id={`zone-${fullLap.id}-${i}`}
+                      onBlur={(e) => { if (e.target.value !== z.name) onRenameZone(i, e.target.value); }}
+                      onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); }}
+                    />
+                    <span className="corner-peak num">{Math.round(z.peak * 100)}%</span>
+                    <span className="corner-sp num">{z.speedIn}&rarr;{z.speedMin}</span>
+                  </div>
+                  <CornerNote
+                    zoneN={z.n} name={z.name} isCoach={isCoach}
+                    body={notes?.[z.n]} onSave={onSaveNote} />
                 </div>
               ))}
             </div>
@@ -3030,6 +3161,11 @@ function Garage({
           </div>
         </div>
         <div className="dock-actions">
+          <label className="check" title="Show the coach's note for each corner as you reach it">
+            <input type="checkbox" checked={!!showNotes}
+              onChange={(e) => setShowNotes(e.target.checked)} />
+            <span>Coach notes</span>
+          </label>
           <label className="check" title="Hide the throttle and steering traces and score the brake alone">
             <input type="checkbox" checked={!!brakeOnly}
               onChange={(e) => setBrakeOnly(e.target.checked)} />
@@ -3359,7 +3495,7 @@ function Calibrate({ cal, onSave, onCancel }) {
       </header>
 
       {devices.length === 0 ? (
-        <div className="empty">
+        <div className="empty-state">
           <h2 className="h1">Nothing detected yet</h2>
           <p className="lede">
             Browsers hide a wheel or pedal set until it sends its first input.
@@ -3466,7 +3602,7 @@ function Calibrate({ cal, onSave, onCancel }) {
 }
 
 /* ---------------- Run ---------------- */
-function Run({ lap, cal, keyboard, feel, label, brakeOnly = false, onFinish, onAbort }) {
+function Run({ lap, cal, keyboard, feel, label, brakeOnly = false, notes = null, onFinish, onAbort }) {
   const cvs = useRef(null);
   const wrap = useRef(null);
   const readInput = useInputDevice(cal, keyboard, feel);
@@ -3706,6 +3842,8 @@ function Run({ lap, cal, keyboard, feel, label, brakeOnly = false, onFinish, onA
         setHud({
           t, live: Math.round(ema.current),
           corner: nextM ? `T${nextM.n} ${nextM.name}` : "",
+          cornerN: nextM ? nextM.n : 0,
+          cornerIn: nextM ? nextM.t - t : Infinity,
           fps: Math.round(fps), frameMs, clip: inp.clipping,
         });
       }
@@ -3718,6 +3856,18 @@ function Run({ lap, cal, keyboard, feel, label, brakeOnly = false, onFinish, onA
   }, [lap, readInput, onFinish, brakeOnly]);
 
   const pre = hud.t < 0;
+
+  /* Show the walk-through for the corner that is coming, and take it away
+     once the driver is in it. Reading a paragraph mid-corner is the opposite
+     of what this is for — the words are for the approach, which in a
+     corners-only drill is exactly what the gaps between corners are. */
+  const noteNow = (() => {
+    if (!notes) return null;
+    if (pre) return notes[0] ?? notes[hud.cornerN] ?? null;
+    if (!(hud.cornerIn > 0.9)) return null;
+    return notes[hud.cornerN] ?? null;
+  })();
+
   return (
     <div className="run">
       <div className="run-top">
@@ -3728,6 +3878,12 @@ function Run({ lap, cal, keyboard, feel, label, brakeOnly = false, onFinish, onA
         </div>
         <button className="btn ghost sm" onClick={onAbort}>End</button>
       </div>
+      {noteNow && (
+        <div className="run-note">
+          <span className="run-note-corner">{hud.corner || "Before the lap"}</span>
+          <span className="run-note-body">{noteNow}</span>
+        </div>
+      )}
       <div className="run-canvas" ref={wrap}><canvas ref={cvs} /></div>
       <div className="run-bottom">
         <span className="next">{hud.corner && `Next: ${hud.corner}`}</span>
@@ -3827,7 +3983,7 @@ function Logbook({ driver, onOpen, onBack }) {
       {err && <p className="err">{err}</p>}
 
       {rows.length === 0 ? (
-        <div className="empty">
+        <div className="empty-state">
           <h2 className="h1">No runs yet</h2>
           <p className="lede">
             Every session you finish is saved here automatically, with both traces
@@ -3900,7 +4056,7 @@ function SavedRun({ rec, onBack }) {
 }
 
 /* ---------------- Results ---------------- */
-function Results({ r, best, saved, onRetry, onGarage }) {
+function Results({ r, best, saved, notes = null, onRetry, onGarage }) {
   const cvs = useRef(null);
 
   useEffect(() => {
@@ -4017,13 +4173,20 @@ function Results({ r, best, saved, onRetry, onGarage }) {
             </thead>
             <tbody>
               {r.zones.map((z, i) => (
-                <tr key={i}>
-                  <td className="z-name">{z.name}</td>
-                  <td className="num">{Math.round(z.drvPeak * 100)}%</td>
-                  <td className="num dim">{Math.round(z.refPeak * 100)}%</td>
-                  <td className="num">{z.bpDelta === null ? "—" : `${z.bpDelta > 0 ? "+" : ""}${(z.bpDelta * 1000).toFixed(0)}ms`}</td>
-                  <td className="num" style={{ color: z.score > 75 ? C.text : z.score > 50 ? C.warn : C.bad }}>{z.score}</td>
-                </tr>
+                <React.Fragment key={i}>
+                  <tr className={notes?.[z.n] ? "has-note" : ""}>
+                    <td className="z-name">{z.name}</td>
+                    <td className="num">{Math.round(z.drvPeak * 100)}%</td>
+                    <td className="num dim">{Math.round(z.refPeak * 100)}%</td>
+                    <td className="num">{z.bpDelta === null ? "—" : `${z.bpDelta > 0 ? "+" : ""}${(z.bpDelta * 1000).toFixed(0)}ms`}</td>
+                    <td className="num" style={{ color: z.score > 75 ? C.text : z.score > 50 ? C.warn : C.bad }}>{z.score}</td>
+                  </tr>
+                  {notes?.[z.n] && (
+                    <tr className="note-row">
+                      <td colSpan={5}>{notes[z.n]}</td>
+                    </tr>
+                  )}
+                </React.Fragment>
               ))}
             </tbody>
           </table>
@@ -4077,7 +4240,7 @@ function Styles() {
 .signin{min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px;}
 .signin-inner{width:100%; max-width:560px;}
 .vcaso-logo{display:block;height:28px;width:auto;margin:0 auto 28px}
-.vcaso-logo.top{display:block!important;flex:none;align-self:center;width:96px!important;height:auto!important;margin:6px auto 14px}
+.vcaso-logo.top{display:block;flex:none;align-self:center;width:96px;height:auto;margin:6px auto 18px}
 .signin-trace{width:100%; height:64px; display:block; margin-bottom:28px; opacity:.85;}
 .drivers{margin-bottom:12px;}
 .drivers li{display:flex; align-items:stretch; gap:6px;}
@@ -4096,7 +4259,7 @@ function Styles() {
 
 /* garage */
 .garage{min-height:100vh; display:flex; flex-direction:column; padding:22px 26px 0;}
-.top{display:flex; align-items:center; justify-content:space-between; gap:16px;
+header.top{display:flex; align-items:center; justify-content:space-between; gap:16px;
   padding-bottom:18px; border-bottom:1px solid var(--line); margin-bottom:20px;}
 .who{color:var(--dim); font-size:14px;}
 .cats{display:flex; gap:6px; flex-wrap:wrap;}
@@ -4132,7 +4295,7 @@ function Styles() {
 
 /* calibration */
 .cal{min-height:100vh; padding:22px 26px;}
-.empty{max-width:52ch; padding-top:40px;}
+.empty-state{max-width:52ch; padding-top:40px;}
 .cal-body{display:grid; grid-template-columns:1.1fr 1fr; gap:36px;}
 .steps{list-style:none; margin:22px 0 0; padding:0; display:flex; flex-direction:column; gap:2px;}
 .step{display:flex; gap:14px; padding:13px 14px; border-left:2px solid var(--line); background:var(--panel);}
@@ -4266,9 +4429,9 @@ function Styles() {
    overflow pushed "sign out" off the right edge where it could not be
    reached. Let the row wrap instead. */
 @media (max-width:760px){
-  .top{flex-wrap:wrap; row-gap:12px;}
-  .top .dock-actions{width:100%; justify-content:flex-start; flex-wrap:wrap; gap:8px;}
-  .top .who-btn{margin-left:auto; text-align:right;}
+  header.top{flex-wrap:wrap; row-gap:12px;}
+  header.top .dock-actions{width:100%; justify-content:flex-start; flex-wrap:wrap; gap:8px;}
+  header.top .who-btn{margin-left:auto; text-align:right;}
   .cat{padding:7px 14px; font-size:13.5px;}
 }
 
@@ -4276,6 +4439,41 @@ function Styles() {
   .vcaso-logo.big{height:28px; margin-bottom:18px;}
   .display-name{font-size:14px; letter-spacing:.09em;}
   .trace-strip{height:54px; margin-bottom:20px;}
+}
+
+/* the coach's walk-through */
+.corner-note{margin:0 0 8px;}
+.corner-note.read{color:var(--dim); font-size:13px; line-height:1.5; margin:2px 0 12px;
+  padding:8px 12px; border-left:2px solid var(--line2, #333); background:var(--panel);
+  border-radius:0 10px 10px 0;}
+.corner-note.read.editable{cursor:text;}
+.corner-note.read.editable:hover{border-left-color:var(--ui); color:var(--text);}
+.corner-note.read.overview{border-left-color:var(--ui); color:var(--text); margin-bottom:16px;}
+.corner-note-label{display:block; font-size:11px; letter-spacing:.1em; text-transform:uppercase;
+  color:var(--dimmer); margin-bottom:5px;}
+.corner-note.add{background:none; border:none; padding:2px 0 10px; color:var(--dimmer);
+  font:inherit; font-size:12.5px; cursor:pointer; text-decoration:underline;
+  text-underline-offset:3px; text-decoration-color:var(--line);}
+.corner-note.add:hover{color:var(--text);}
+.corner-note.edit{display:grid; gap:5px; margin:4px 0 12px;}
+.corner-note.edit .fine{margin:0;}
+
+/* during a run */
+.run-note{margin:0 22px 8px; padding:12px 18px; border-radius:14px;
+  background:var(--panel); border:1px solid var(--line);
+  display:flex; gap:16px; align-items:baseline;}
+.run-note-corner{font-size:12px; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--dimmer); flex:none;}
+.run-note-body{font-size:16px; line-height:1.45; color:var(--text);}
+
+/* in the results */
+.tbl tr.has-note td{border-bottom:none;}
+.tbl tr.note-row td{padding:0 0 11px; color:var(--dim); font-size:13px; line-height:1.5;
+  text-align:left; border-bottom:1px solid var(--panel2);}
+
+@media (max-width:760px){
+  .run-note{flex-direction:column; gap:4px; margin:0 16px 8px; padding:10px 14px;}
+  .run-note-body{font-size:15px;}
 }
 
 /* accounts, requests and the board */
