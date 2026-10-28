@@ -9,10 +9,16 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from "react"
    ============================================================ */
 
 const HZ = 50;                 // reference + capture sample rate
-const LOOKBACK = 2.2;          // seconds of trace visible behind the playhead
-const LOOKAHEAD = 5.0;         // seconds of trace visible ahead of it
+/* The playhead sits in the middle of the screen, so the eye has one place to
+   be. It used to sit a third of the way across, which bought more warning of
+   what was coming at the cost of making the driver track a line off to one
+   side while braking — Reza called that out and he is right.
+   Centred means the trace behind and the trace ahead are the same length, so
+   there is one number to set: how many seconds of lap you see coming. */
+const EYES_AHEAD = 3.6;        // seconds visible ahead of the playhead, and behind it
+const EYES_MIN = 2.0;
+const EYES_MAX = 6.5;
 const LEADIN = 4.0;            // roll-in before the lap starts
-const PLAYHEAD = LOOKBACK / (LOOKBACK + LOOKAHEAD);
 
 /* Black and white, with colour reserved for information.
    `ui` is the accent for anything you press or that is selected — white, so
@@ -1554,7 +1560,10 @@ const calMissing = (cal, pads) =>
    peak shape disappears, which is the one shape that matters most here.
    Raising the range asks for more pressure before full scale, so the peak
    has somewhere to go. */
-const BLANK_FEEL = { steerGain: 1.0, brakeCurve: 1.0, steerDeadzone: 0.0, brakeRange: 1.0 };
+const BLANK_FEEL = {
+  steerGain: 1.0, brakeCurve: 1.0, steerDeadzone: 0.0, brakeRange: 1.0,
+  eyesAhead: EYES_AHEAD,
+};
 
 function useInputDevice(cal, keyboard, feel = BLANK_FEEL) {
   const keys = useRef({});
@@ -3309,6 +3318,21 @@ function Feel({ cal, feel, setFeel, keyboard, onDone }) {
             <span className="num">{feel.brakeCurve.toFixed(2)}</span>
           </div>
 
+          <h2 className="h2" style={{ marginTop: 26 }}>Eyes ahead</h2>
+          <p className="lede">
+            How many seconds of the lap you see coming. The playhead stays in
+            the middle of the screen, so the same amount shows behind it. Less
+            means a bigger, clearer brake shape but later warning; more means
+            earlier warning on a smaller shape. On a single laptop screen try
+            a higher number, on a wide triple-screen rig a lower one.
+          </p>
+          <div className="slider">
+            <input type="range" min={EYES_MIN} max={EYES_MAX} step="0.1" id="eyesAhead"
+              value={feel.eyesAhead ?? EYES_AHEAD}
+              onChange={(e) => set("eyesAhead", Number(e.target.value))} />
+            <span className="num">{(feel.eyesAhead ?? EYES_AHEAD).toFixed(1)}s</span>
+          </div>
+
           <h2 className="h2" style={{ marginTop: 26 }}>Steering deadzone</h2>
           <div className="slider">
             <input type="range" min="0" max="0.1" step="0.005" id="steerDeadzone"
@@ -3676,6 +3700,7 @@ function Run({ lap, cal, keyboard, feel, label, brakeOnly = false, notes = null,
       ];
     };
 
+    const look = clamp(Number(feel?.eyesAhead) || EYES_AHEAD, EYES_MIN, EYES_MAX);
     const errColor = (e) => (e < 0.06 ? C.good : e < 0.15 ? C.warn : C.bad);
 
     const draw = (now, inp) => {
@@ -3684,8 +3709,10 @@ function Run({ lap, cal, keyboard, feel, label, brakeOnly = false, notes = null,
       x.fillStyle = C.bg;
       x.fillRect(0, 0, W, H);
 
-      const span = LOOKBACK + LOOKAHEAD;
-      const t0 = now - LOOKBACK;
+      /* Equal either side puts the playhead dead centre: tx(now) works out
+         at exactly half the width, whatever `look` is set to. */
+      const span = look * 2;
+      const t0 = now - look;
       const tx = (tt) => ((tt - t0) / span) * W;
       const px = tx(now);
 
@@ -3853,7 +3880,7 @@ function Run({ lap, cal, keyboard, feel, label, brakeOnly = false, notes = null,
     };
     raf = requestAnimationFrame(loop);
     return () => { cancelAnimationFrame(raf); ro.disconnect(); };
-  }, [lap, readInput, onFinish, brakeOnly]);
+  }, [lap, readInput, onFinish, brakeOnly, feel?.eyesAhead]);
 
   const pre = hud.t < 0;
 
