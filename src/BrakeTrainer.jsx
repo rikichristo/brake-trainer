@@ -71,6 +71,53 @@ const store = {
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const idx = (t) => Math.round(t * HZ);
 
+/* A row from the team's drill library, turned into the same kind of lap
+   object the built-in references produce. Everything downstream — zones,
+   drills, scoring, coach notes — then works on it without knowing where it
+   came from. The name the engineer gave it stands in for the circuit, since
+   that is what a driver is picking from a list. */
+function drillToLap(row) {
+  const lap = unpackLap(row.payload);
+  lap.id = `team:${row.id}`;
+
+  /* A payload can arrive with no braking zones listed — an older export, a
+     source the importer did not recognise, or an engineer's file that was
+     packed before zones were detected. Trusting an empty list silently turns
+     the corners-only drill into a zero-second lap and a blank screen, which
+     looks like the data is broken rather than the index. Detect them. */
+  if (!lap.zones || lap.zones.length === 0) {
+    const speed = lap.speed ?? new Float32Array(lap.n);
+    const dist = lap.dist ?? new Float32Array(lap.n);
+    const trackM = row.payload?.trackM || 0;
+    lap.zones = findZones(lap.brake).map(([a, b], k) => {
+      let peak = 0, vMin = Infinity;
+      for (let i = a; i <= b; i++) {
+        if (lap.brake[i] > peak) peak = lap.brake[i];
+        if (speed[i] < vMin) vMin = speed[i];
+      }
+      return {
+        n: k + 1, name: `Zone ${k + 1}`,
+        t: a / HZ, dur: (b - a) / HZ, peak,
+        at: Math.round((dist[a] ?? 0) * (trackM || lap.n / HZ)),
+        speedIn: Math.round(speed[a] ?? 0),
+        speedMin: Number.isFinite(vMin) ? Math.round(vMin) : 0,
+      };
+    });
+    lap.markers = lap.zones.map((z) => ({ n: z.n, name: z.name, t: z.t }));
+  }
+  lap.meta = {
+    ...lap.meta,
+    circuit: lap.meta.track,
+    track: row.name,
+    car: row.source || lap.meta.car || "Team drill",
+    teamDrill: true,
+    drillId: row.id,
+    drillNote: row.description || "",
+    author: row.author_id,
+  };
+  return lap;
+}
+
 /* ------------------------------------------------------------
    THE ACCOUNT SIDE
    VCASO Performance drivers, in Riki's own Supabase project. Everything
@@ -315,6 +362,60 @@ const cloud = {
     const { data, error } = await sb.from("bt_runs").select("trace").eq("id", id).maybeSingle();
     if (error) throw error;
     try { return data?.trace ? JSON.parse(data.trace) : null; } catch { return null; }
+  },
+
+  /* Which team this person belongs to, and what they may do in it. Two
+     queries rather than an embedded join: fewer ways for it to fail, and
+     this runs on every sign-in. */
+  async myTeam() {
+    const sb = client(); if (!sb) return null;
+    const { data: u } = await sb.auth.getUser();
+    if (!u?.user) return null;
+    const { data: m, error } = await sb.from("vp_members")
+      .select("team_id,role,driver_id").eq("user_id", u.user.id).limit(1).maybeSingle();
+    if (error) throw error;
+    if (!m) return null;
+    const { data: t } = await sb.from("vp_teams")
+      .select("name,slug").eq("id", m.team_id).maybeSingle();
+    return {
+      id: m.team_id, role: m.role, driverId: m.driver_id,
+      name: t?.name ?? "Team", slug: t?.slug ?? "",
+      canWrite: ["owner", "coach", "engineer"].includes(m.role),
+    };
+  },
+
+  /* The team's drill library. Each payload is a packed lap in exactly the
+     format the built-in references use, so the trainer can run one without
+     knowing it came from the team rather than from the bundle. */
+  async teamDrills(teamId) {
+    const sb = client(); if (!sb || !teamId) return [];
+    const { data, error } = await sb.from("vp_drills")
+      .select("id,name,description,source,payload,created_at,author_id")
+      .eq("team_id", teamId).order("created_at", { ascending: false });
+    if (error) throw error;
+    return data ?? [];
+  },
+
+  async addTeamDrill(teamId, { name, description, source, payload }) {
+    const sb = client(); if (!sb) throw new Error("offline");
+    const { data: u } = await sb.auth.getUser();
+    if (!u?.user) throw new Error("Sign in again.");
+    const { data, error } = await sb.from("vp_drills").insert({
+      team_id: teamId,
+      name: String(name).trim().slice(0, 80),
+      description: String(description ?? "").trim().slice(0, 2000),
+      source: String(source ?? "").slice(0, 200),
+      payload,
+      author_id: u.user.id,
+    }).select("id,name,description,source,payload,created_at,author_id").maybeSingle();
+    if (error) throw error;
+    return data;
+  },
+
+  async deleteTeamDrill(id) {
+    const sb = client(); if (!sb) throw new Error("offline");
+    const { error } = await sb.from("vp_drills").delete().eq("id", id);
+    if (error) throw error;
   },
 
   /* A coach's corner-by-corner walk-through of one reference lap, keyed by
@@ -1816,6 +1917,8 @@ export default function BrakeTrainer() {
   const [brakeOnly, setBrakeOnly] = useState(false);
   const [showNotes, setShowNotes] = useState(true);
   const [notes, setNotes] = useState({});
+  const [team, setTeam] = useState(null);
+  const [teamLaps, setTeamLaps] = useState([]);
   const [viewing, setViewing] = useState(null);
   const [keyboard, setKeyboard] = useState(false);
   const [imported, setImported] = useState(() => loadSavedLapRecords().map(unpackLap));
@@ -1873,6 +1976,19 @@ export default function BrakeTrainer() {
     /* Calibration only travels if this machine has none of its own; the axes
        on someone else's rig are not the axes on this one. */
     if (remote?.cal && !store.get("bt:cal")) setCal(remote.cal);
+
+    /* The team, and the drills it shares. Both are best-effort: a driver
+       whose team lookup fails still gets the built-in laps rather than a
+       dead app. */
+    try {
+      const t = await cloud.myTeam();
+      setTeam(t);
+      if (t) {
+        const rows = await cloud.teamDrills(t.id);
+        setTeamLaps(rows.map(drillToLap));
+      }
+    } catch { setTeam(null); setTeamLaps([]); }
+
     setScreen("garage");
   }, []);
 
@@ -1903,7 +2019,7 @@ export default function BrakeTrainer() {
     }).catch(() => setSyncNote("Your settings are saved on this machine but did not reach the server."));
   }, [driver, feel, bests, brakeOnly, showNotes, cal]);
 
-  const all = useMemo(() => [...LAPS, ...imported], [imported]);
+  const all = useMemo(() => [...LAPS, ...teamLaps, ...imported], [teamLaps, imported]);
   const [nameRev, setNameRev] = useState(0);   // bump to re-read custom names
   const fullLap = useMemo(
     () => applyZoneNames(all.find((l) => l.id === lapId) ?? all[0]),
@@ -1966,6 +2082,31 @@ export default function BrakeTrainer() {
   const saveFeel = (f) => { setFeel(f); persist({ feel: f }); };
   const saveBrakeOnly = (v) => { setBrakeOnly(v); persist({ brakeOnly: v }); };
   const saveShowNotes = (v) => { setShowNotes(v); persist({ showNotes: v }); };
+
+  /* Put a lap into the team's library. This is the thing Riki wanted: an
+     engineer does it themselves, and every driver in the team has it next
+     time they open the app. */
+  const shareWithTeam = useCallback(async (lap, name, description) => {
+    if (!team?.canWrite) throw new Error("Only a coach or engineer can do that.");
+    const row = await cloud.addTeamDrill(team.id, {
+      name,
+      description,
+      source: `${lap.meta?.car ?? ""} ${lap.meta?.track ?? ""}`.trim(),
+      payload: packLap(lap),
+    });
+    const asLap = drillToLap(row);
+    setTeamLaps((p) => [asLap, ...p.filter((x) => x.id !== asLap.id)]);
+    setLapId(asLap.id);
+    setDrillId("corners");
+    return asLap;
+  }, [team]);
+
+  const removeFromTeam = useCallback(async (drillId) => {
+    await cloud.deleteTeamDrill(drillId);
+    setTeamLaps((p) => p.filter((x) => x.meta.drillId !== drillId));
+    setLapId(LAPS[0]?.id ?? "");
+    setDrillId("corners");
+  }, []);
 
   const saveNote = useCallback(async (zoneN, body) => {
     const before = notes[zoneN];
@@ -2030,6 +2171,7 @@ export default function BrakeTrainer() {
           driver={driver} account={account} syncNote={syncNote}
           brakeOnly={brakeOnly} setBrakeOnly={saveBrakeOnly}
           showNotes={showNotes} setShowNotes={saveShowNotes}
+          team={team} onShareWithTeam={shareWithTeam} onRemoveFromTeam={removeFromTeam}
           notes={notes} onSaveNote={saveNote} isCoach={account?.role === "coach"}
           onAccount={driver?.cloud ? () => setScreen("account") : null}
           onRequests={account?.role === "coach" ? () => setScreen("requests") : null}
@@ -2968,10 +3110,14 @@ function Garage({
   driver, account, syncNote, onSwitchDriver, cat, setCat, all, lapId, setLapId, fullLap,
   drills, drillId, setDrillId, lap, cal, keyboard, setKeyboard, best, onImport, lapWarn,
   onDeleteLap, brakeOnly, setBrakeOnly, showNotes, setShowNotes, notes, onSaveNote,
-  isCoach, onCalibrate, onFeel, onLogbook, onRenameZone,
-  onAccount, onRequests, onBoard, onStart,
+  isCoach, team, onShareWithTeam, onRemoveFromTeam, onCalibrate, onFeel, onLogbook,
+  onRenameZone, onAccount, onRequests, onBoard, onStart,
 }) {
   const [pending, setPending] = useState(0);
+  const [sharing, setSharing] = useState(null);   // the lap being named for the team
+  const [shareName, setShareName] = useState("");
+  const [shareNote, setShareNote] = useState("");
+  const [shareBusy, setShareBusy] = useState(false);
   const [pads, setPads] = useState([]);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState("");
@@ -3090,10 +3236,13 @@ function Garage({
               <li key={l.id}>
                 <button className={`item ${lapId === l.id ? "on" : ""}`}
                   onClick={() => { setLapId(l.id); setDrillId("corners"); }}>
-                  <span className="item-name">{lapLabel(l)}</span>
+                  <span className="item-name">
+                    {lapLabel(l)}
+                    {l.meta.teamDrill && <span className="tag">team</span>}
+                  </span>
                   <span className="item-sub num">{fmtLapTime(l.meta.lapTime)}</span>
                 </button>
-                {l.meta.imported && (
+                {l.meta.imported && !l.meta.teamDrill && (
                   <button className={`x ${confirmDel === l.id ? "armed" : ""}`}
                     title={`Remove ${lapLabel(l)}`}
                     onClick={() => {
@@ -3107,17 +3256,83 @@ function Garage({
             ))}
           </ul>
           <p className="fine">
-            {fullLap.meta.imported
-              ? `Imported · ${fullLap.meta.note ?? ""}`
-              : `${fullLap.meta.driver}, ${fullLap.meta.car}` +
-                (fullLap.meta.config ? ` · ${fullLap.meta.config}` : "")}
+            {fullLap.meta.teamDrill
+              ? `${team?.name ?? "Team"} library${fullLap.meta.circuit ? ` · ${fullLap.meta.circuit}` : ""}`
+              : fullLap.meta.imported
+                ? `Imported · ${fullLap.meta.note ?? ""}`
+                : `${fullLap.meta.driver}, ${fullLap.meta.car}` +
+                  (fullLap.meta.config ? ` · ${fullLap.meta.config}` : "")}
           </p>
+          {fullLap.meta.teamDrill && fullLap.meta.drillNote && (
+            <p className="corner-note read overview" style={{ marginTop: 8 }}>
+              {fullLap.meta.drillNote}
+            </p>
+          )}
           {lapWarn && <p className="err">{lapWarn}</p>}
-          <button className="btn ghost wide" disabled={!!busy} onClick={() => fileRef.current?.click()}>Import telemetry (.ibt, CSV, JSON)</button>
+
+          {/* Naming a lap is what turns it from one engineer's file into
+              something the whole team can drill. Offered straight after an
+              import, which is when the data is in front of them. */}
+          {sharing ? (
+            <div className="share-box">
+              <h3 className="h3">Add to the {team?.name ?? "team"} library</h3>
+              <label className="lbl">Name it
+                <input className="field" autoFocus maxLength={80} value={shareName}
+                  placeholder="e.g. Potato Brake Shape"
+                  onChange={(e) => setShareName(e.target.value)} />
+              </label>
+              <label className="lbl">What should they take from it? <span className="hint">optional</span>
+                <textarea className="field" rows={3} maxLength={2000} value={shareNote}
+                  placeholder="Peak and release — hit it hard, then bleed off all the way to the apex."
+                  onChange={(e) => setShareNote(e.target.value)} />
+              </label>
+              {err && <p className="err">{err}</p>}
+              <div className="cal-actions">
+                <button className="btn primary" disabled={shareBusy || !shareName.trim()}
+                  onClick={async () => {
+                    setShareBusy(true); setErr("");
+                    try {
+                      await onShareWithTeam(sharing, shareName, shareNote);
+                      setSharing(null); setShareName(""); setShareNote("");
+                    } catch (e2) { setErr(String(e2?.message || e2)); }
+                    setShareBusy(false);
+                  }}>
+                  {shareBusy ? "Adding…" : "Add to the library"}
+                </button>
+                <button className="btn" disabled={shareBusy}
+                  onClick={() => { setSharing(null); setErr(""); }}>Cancel</button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <button className="btn ghost wide" disabled={!!busy}
+                onClick={() => fileRef.current?.click()}>Import telemetry (.ibt, CSV, JSON)</button>
+              {team?.canWrite && !fullLap.meta.teamDrill && (
+                <button className="btn ghost wide" disabled={!!busy}
+                  onClick={() => {
+                    setSharing(fullLap);
+                    setShareName(fullLap.meta.track || "");
+                    setShareNote(""); setErr("");
+                  }}>
+                  Add this to the {team.name} library
+                </button>
+              )}
+              {team?.canWrite && fullLap.meta.teamDrill && (
+                <button className="btn ghost wide"
+                  onClick={async () => {
+                    setErr("");
+                    try { await onRemoveFromTeam(fullLap.meta.drillId); }
+                    catch (e2) { setErr(String(e2?.message || e2)); }
+                  }}>
+                  Remove from the library
+                </button>
+              )}
+            </>
+          )}
           <input ref={fileRef} type="file" accept=".ibt,.csv,.txt,.json,.tsv" className="hidden"
             onChange={(e) => handleFile(e.target.files?.[0])} />
           {busy && <p className="fine">{busy}</p>}
-          {err && <p className="err">{err}</p>}
+          {err && !sharing && <p className="err">{err}</p>}
         </section>
 
         <section className="col">
@@ -4495,6 +4710,14 @@ header.top{display:flex; align-items:center; justify-content:space-between; gap:
   .display-name{font-size:14px; letter-spacing:.09em;}
   .trace-strip{height:54px; margin-bottom:20px;}
 }
+
+.share-box{border:1px solid var(--line); border-radius:16px; background:var(--panel);
+  padding:16px; margin-top:10px; display:grid; gap:10px;}
+.share-box .cal-actions{margin-top:2px;}
+.h3{font-size:14px; font-weight:600; margin:0;}
+.tag{display:inline-block; margin-left:8px; padding:1px 8px; border-radius:999px;
+  border:1px solid var(--line2,#333); font-size:10.5px; letter-spacing:.08em;
+  text-transform:uppercase; color:var(--dimmer); vertical-align:middle;}
 
 .masthead{display:block; width:100%; background:none; border:none; padding:0;
   cursor:pointer; font:inherit;}

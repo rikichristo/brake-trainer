@@ -146,8 +146,41 @@ async function submit(dom) {
   await wait(300);
 }
 
+/* A packed lap in the format the app stores: base64 uint8 per channel.
+   Six seconds with one real braking zone in it, so zone detection, drill
+   building and scoring all have something to chew on. */
+function fakePayload() {
+  const HZ = 50, n = 300;
+  const b = Buffer.alloc(n), t = Buffer.alloc(n), st = Buffer.alloc(n);
+  const sp = Buffer.alloc(n), di = Buffer.alloc(n);
+  for (let i = 0; i < n; i++) {
+    const sec = i / HZ;
+    let brake = 0;
+    if (sec > 2.0 && sec < 3.6) {
+      const k = (sec - 2.0) / 1.6;
+      brake = k < 0.15 ? k / 0.15 * 0.9 : 0.9 * (1 - (k - 0.15) / 0.85);
+    }
+    b[i] = Math.max(0, Math.min(255, Math.round(brake * 255)));
+    t[i] = brake > 0.05 ? 0 : 255;
+    st[i] = Math.round((Math.sin(sec) * 0.3 + 1) / 2 * 255);
+    sp[i] = Math.round((200 - brake * 90) / 320 * 255);
+    di[i] = Math.round((i / n) * 255);
+  }
+  const e = (buf) => buf.toString("base64");
+  return {
+    id: "drill-1", category: "f3", car: "Super Formula Lights 324",
+    track: "Adelaide Street Circuit", config: "", driver: "Riki",
+    lapTime: n / HZ, lap: null, trackM: null, hz: HZ, n, imported: true,
+    note: "", source: "",
+    brake: e(b), throttle: e(t), steer: e(st), speed: e(sp), dist: e(di),
+    zones: [],
+  };
+}
+
 /* ---------- worlds ---------- */
-function world({ role = "driver", approved = true, signedIn = true, pending = [] } = {}) {
+function world({ role = "driver", approved = true, signedIn = true, pending = [],
+                 teamRole = null } = {}) {
+  teamRole = teamRole || (role === "coach" ? "owner" : "driver");
   const me = { id: "u-reza", email: "reza@drivers.rikichristo.com", password: "secret12",
                full_name: "Reza Seewooruthun" };
   const w = {
@@ -179,6 +212,20 @@ function world({ role = "driver", approved = true, signedIn = true, pending = []
       }
       if (state.table === "bt_settings") {
         return { data: { data: { feel: { brakeRange: 1.43 }, bests: {}, brakeOnly: false } }, error: null };
+      }
+      if (state.table === "vp_members") {
+        return { data: { team_id: "team-1", role: teamRole, driver_id: null }, error: null };
+      }
+      if (state.table === "vp_teams") {
+        return { data: { name: "Rodin Motorsport", slug: "rodin" }, error: null };
+      }
+      if (state.table === "vp_drills") {
+        return { data: [{
+          id: "drill-1", name: "Potato Brake Shape",
+          description: "Hit it hard, hold, then bleed off all the way to the apex.",
+          source: "Super Formula Lights 324", payload: fakePayload(),
+          created_at: "2026-10-30T18:00:00Z", author_id: "u-riki",
+        }], error: null };
       }
       if (state.table === "bt_coach_notes") {
         return { data: [
@@ -450,7 +497,51 @@ async function run() {
     dom.window.close();
   }
 
-  /* 11. Brake only. */
+  /* 11. The team drill library — the point of the whole team layer. */
+  console.log("\n— team library, as an engineer —");
+  {
+    const w = world({ role: "driver", teamRole: "engineer" });
+    const { dom, errs } = mount(w);
+    await wait(1200);
+    const t = txt(dom);
+    check("team drill in the lap list", t.includes("Potato Brake Shape"), true);
+    check("marked as the team's, not built in", t.includes("team"), true);
+    check("engineer is offered the library",
+      /Add this to the Rodin Motorsport library/.test(t), true);
+
+    await click(dom, "Add this to the Rodin Motorsport library");
+    const root = dom.window.document.getElementById("root");
+    const nameField = [...root.querySelectorAll("input")]
+      .find((i) => (i.placeholder || "").includes("Potato"));
+    check("naming form opens", !!nameField, true);
+    if (nameField) {
+      const set = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value").set;
+      set.call(nameField, "Peak and Release");
+      nameField.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+      await wait(80);
+      await click(dom, "Add to the library");
+      await wait(300);
+    }
+    const sent = w.inserted.find((x) => x.table === "vp_drills");
+    check("drill reached the library", !!sent, true);
+    check("name sent", sent && sent.value.name, "Peak and Release");
+    check("trace sent with it", !!(sent && sent.value.payload && sent.value.payload.brake), true);
+    check("no page errors", errs.length ? errs.join("; ") : "none", "none");
+    dom.window.close();
+  }
+
+  console.log("\n— team library, as a driver —");
+  {
+    const { dom, errs } = mount(world({ role: "driver", teamRole: "driver" }));
+    await wait(1200);
+    const t = txt(dom);
+    check("driver can use the team drill", t.includes("Potato Brake Shape"), true);
+    check("driver is not offered the library", /Add this to the/.test(t), false);
+    check("no page errors", errs.length ? errs.join("; ") : "none", "none");
+    dom.window.close();
+  }
+
+  /* 12. Brake only. */
   console.log("\n— brake only —");
   {
     const { dom, errs } = mount(world({}));
