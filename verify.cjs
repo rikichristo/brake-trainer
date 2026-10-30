@@ -139,6 +139,14 @@ async function type(dom, placeholderPart, value) {
   await wait(60);
 }
 
+/* Signing in lands on the team home page now, not the garage. Anything
+   checking garage content has to walk there first. */
+async function toGarage(dom) {
+  if (txt(dom).includes("Run session") || txt(dom).includes("Not your session")) return;
+  const b = findBtn(dom, "Garage");
+  if (b) { b.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true })); await wait(260); }
+}
+
 async function submit(dom) {
   const f = dom.window.document.getElementById("root").querySelector("form");
   if (!f) throw new Error("no form on screen");
@@ -219,6 +227,21 @@ function world({ role = "driver", approved = true, signedIn = true, pending = []
       if (state.table === "vp_teams") {
         return { data: { name: "Rodin Motorsport", slug: "rodin" }, error: null };
       }
+      if (state.table === "vp_series") {
+        return { data: [
+          { id: "s-f3", name: "FIA F3" },
+          { id: "s-f2", name: "FIA F2" },
+          { id: "s-gt", name: "British GT" },
+        ], error: null };
+      }
+      if (state.table === "vp_drivers") {
+        return { data: [
+          { id: "d-reza", full_name: "Reza Seewooruthun", car_no: "19", nat: "",
+            active: true, user_id: "u-reza", series_id: "s-f3" },
+          { id: "d-pedro", full_name: "Pedro Clerot", car_no: "17", nat: "",
+            active: true, user_id: "u-pedro", series_id: "s-f3" },
+        ], error: null };
+      }
       if (state.table === "vp_drills") {
         return { data: [{
           id: "drill-1", name: "Potato Brake Shape",
@@ -243,6 +266,14 @@ function world({ role = "driver", approved = true, signedIn = true, pending = []
             is_me: false, last_at: "2026-10-23T10:00:00Z" },
           { lap_id: "x", lap_label: "l", display_name: me.full_name, best: 88, runs: 4,
             is_me: true, last_at: "2026-10-24T10:00:00Z" },
+        ];
+      }
+      if (name === "vp_driver_hours") {
+        return [
+          { driver_id: "d-reza", display_name: "Reza Seewooruthun", track: "Adelaide Street Circuit",
+            runs: 4, seconds: 3820, best: 88, last_at: "2026-10-30T10:00:00Z" },
+          { driver_id: "d-pedro", display_name: "Pedro Clerot", track: "Silverstone Circuit",
+            runs: 11, seconds: 15240, best: 94, last_at: "2026-10-29T10:00:00Z" },
         ];
       }
       if (name === "bt_leaderboard_overall") {
@@ -284,7 +315,9 @@ async function run() {
     const w = world({});
     const { dom, errs } = mount(w);
     await wait(900);
-    check("lands in the garage", txt(dom).includes("Run session"), true);
+    check("lands on the team home page", txt(dom).includes("Rodin Motorsport"), true);
+    await toGarage(dom);
+    check("garage reachable from home", txt(dom).includes("Run session"), true);
     check("name shown", txt(dom).includes("Reza"), true);
     check("leaderboard offered", !!findBtn(dom, "Leaderboard"), true);
     check("account offered", !!findBtn(dom, "Account"), true);
@@ -329,7 +362,7 @@ async function run() {
     }];
     const { dom, errs } = mount(world({ role: "coach", pending }));
     await wait(1000);
-    check("request count in the garage", /Requests \(1\)/.test(txt(dom)), true);
+    check("request count on the landing page", /Requests \(1\)/.test(txt(dom)), true);
     await click(dom, "Requests");
     check("shows who asked", txt(dom).includes("Sam Hunt"), true);
     check("shows how to reach them", txt(dom).includes("sam#1234"), true);
@@ -359,7 +392,7 @@ async function run() {
     set.call(pw, "secret12");
     pw.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
     await submit(dom);
-    check("accepts the right one", txt(dom).includes("Run session"), true);
+    check("accepts the right one", txt(dom).includes("Rodin Motorsport"), true);
     check("asked for a login", w.inserted.length >= 0, true);
     check("no page errors", errs.length ? errs.join("; ") : "none", "none");
     dom.window.close();
@@ -429,6 +462,7 @@ async function run() {
     const w = world({ role: "coach" });
     const { dom, errs } = mount(w);
     await wait(1100);
+    await toGarage(dom);
     const t = txt(dom);
     check("existing note shown", t.includes("big hit and hold"), true);
     check("lap overview shown", t.includes("Overview: this lap rewards"), true);
@@ -464,6 +498,7 @@ async function run() {
   {
     const { dom, errs } = mount(world({}));
     await wait(1100);
+    await toGarage(dom);
     const t = txt(dom);
     const root = dom.window.document.getElementById("root");
     check("driver reads the note", t.includes("big hit and hold"), true);
@@ -478,19 +513,25 @@ async function run() {
   {
     const { dom, errs } = mount(world({ role: "coach" }));
     await wait(1000);
+    const root0 = dom.window.document.getElementById("root");
+    // Home is home, so its mark is a plain image with nothing to press.
+    check("home shows the mark, not a button",
+      !!root0.querySelector("img.vcaso-logo") && !root0.querySelector("button.masthead"), true);
+    await toGarage(dom);
     const root = dom.window.document.getElementById("root");
-    check("garage shows the mark, not a button",
-      !!root.querySelector("img.vcaso-logo") && !root.querySelector("button.masthead"), true);
+    check("the garage mark is pressable", !!root.querySelector("button.masthead"), true);
 
     for (const where of ["Leaderboard", "Account", "Requests", "Logbook"]) {
+      // Logbook lives in the garage dock, not on the landing page.
+      if (where === "Logbook") await toGarage(dom);
       await click(dom, where);
       const mast = dom.window.document.getElementById("root").querySelector("button.masthead");
       check(`${where} carries a clickable mark`, !!mast, true);
       if (mast) {
         mast.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
         await wait(220);
-        check(`${where} → mark returns to the garage`,
-          txt(dom).includes("Run session"), true);
+        check(`${where} → mark returns home`,
+          txt(dom).includes("Rodin Motorsport"), true);
       }
     }
     check("no page errors", errs.length ? errs.join("; ") : "none", "none");
@@ -503,6 +544,7 @@ async function run() {
     const w = world({ role: "driver", teamRole: "engineer" });
     const { dom, errs } = mount(w);
     await wait(1200);
+    await toGarage(dom);
     const t = txt(dom);
     check("team drill in the lap list", t.includes("Potato Brake Shape"), true);
     check("marked as the team's, not built in", t.includes("team"), true);
@@ -534,6 +576,7 @@ async function run() {
   {
     const { dom, errs } = mount(world({ role: "driver", teamRole: "driver" }));
     await wait(1200);
+    await toGarage(dom);
     const t = txt(dom);
     check("driver can use the team drill", t.includes("Potato Brake Shape"), true);
     check("driver is not offered the library", /Add this to the/.test(t), false);
@@ -541,11 +584,52 @@ async function run() {
     dom.window.close();
   }
 
-  /* 12. Brake only. */
+  /* 12. The team home page. */
+  console.log("\n— team home page —");
+  {
+    const { dom, errs } = mount(world({}));
+    await wait(1200);
+    const t = txt(dom);
+    check("team name shown", t.includes("Rodin Motorsport"), true);
+    check("programmes listed", t.includes("FIA F3") && t.includes("British GT"), true);
+    check("driver count per programme", /FIA F3\s*2/.test(t.replace(/\s+/g, " ")), true);
+    check("roster shown", t.includes("Pedro Clerot"), true);
+    check("time at the wheel shown", /\dh \d\dm/.test(t), true);
+    check("runs logged shown", t.includes("11 runs"), true);
+    check("marks which driver is you", t.includes("you"), true);
+
+    // your own name drives — target the roster row specifically
+    const rosterBtn = (name) => [...dom.window.document.getElementById("root")
+      .querySelectorAll("button.driver")].find((b) => b.textContent.includes(name));
+    check("sign out does not wear your name",
+      [...dom.window.document.getElementById("root").querySelectorAll("button")]
+        .some((b) => b.textContent.trim() === "Sign out"), true);
+    rosterBtn("Reza Seewooruthun")
+      .dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
+    await wait(300);
+    check("own name opens a drivable garage", txt(dom).includes("Run session"), true);
+    check("no read-only banner for yourself", txt(dom).includes("Not your session"), false);
+
+    // a team mate's record is read-only
+    const mast = dom.window.document.getElementById("root").querySelector("button.masthead");
+    if (mast) { mast.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true })); await wait(300); }
+    const back = [...dom.window.document.getElementById("root")
+      .querySelectorAll("button.driver")].find((b) => b.textContent.includes("Pedro"));
+    if (back) { back.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true })); await wait(300); }
+    const t2 = txt(dom);
+    check("team mate's record opens", t2.includes("Pedro Clerot"), true);
+    check("driving is off for someone else", t2.includes("Not your session"), true);
+    check("and it says why", t2.includes("records against whoever is signed in"), true);
+    check("no page errors", errs.length ? errs.join("; ") : "none", "none");
+    dom.window.close();
+  }
+
+  /* 13. Brake only. */
   console.log("\n— brake only —");
   {
     const { dom, errs } = mount(world({}));
     await wait(900);
+    await toGarage(dom);
     const box = [...dom.window.document.getElementById("root").querySelectorAll('input[type="checkbox"]')]
       .find((i) => i.closest("label") && i.closest("label").textContent.includes("Brake only"));
     check("brake-only switch in the garage", !!box, true);

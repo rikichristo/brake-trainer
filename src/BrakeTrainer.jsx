@@ -384,6 +384,32 @@ const cloud = {
     };
   },
 
+  async teamSeries(teamId) {
+    const sb = client(); if (!sb || !teamId) return [];
+    const { data, error } = await sb.from("vp_series")
+      .select("id,name").eq("team_id", teamId).order("name");
+    if (error) throw error;
+    return data ?? [];
+  },
+
+  async teamDrivers(teamId) {
+    const sb = client(); if (!sb || !teamId) return [];
+    const { data, error } = await sb.from("vp_drivers")
+      .select("id,full_name,car_no,nat,active,user_id,series_id")
+      .eq("team_id", teamId).eq("active", true).order("car_no");
+    if (error) throw error;
+    return data ?? [];
+  },
+
+  /* Time at the wheel, per driver per track, built from the runs already
+     logged rather than from anything a driver has to remember to do. */
+  async driverHours(teamId) {
+    const sb = client(); if (!sb || !teamId) return [];
+    const { data, error } = await sb.rpc("vp_driver_hours", { p_team: teamId });
+    if (error) throw error;
+    return data ?? [];
+  },
+
   /* The team's drill library. Each payload is a packed lap in exactly the
      format the built-in references use, so the trainer can run one without
      knowing it came from the team rather than from the bundle. */
@@ -1919,6 +1945,11 @@ export default function BrakeTrainer() {
   const [notes, setNotes] = useState({});
   const [team, setTeam] = useState(null);
   const [teamLaps, setTeamLaps] = useState([]);
+  const [series, setSeries] = useState([]);
+  const [roster, setRoster] = useState([]);
+  const [hours, setHours] = useState([]);
+  const [lastSeries, setLastSeries] = useState(null);
+  const [viewDriver, setViewDriver] = useState(null);   // whose record is open
   const [viewing, setViewing] = useState(null);
   const [keyboard, setKeyboard] = useState(false);
   const [imported, setImported] = useState(() => loadSavedLapRecords().map(unpackLap));
@@ -1984,12 +2015,21 @@ export default function BrakeTrainer() {
       const t = await cloud.myTeam();
       setTeam(t);
       if (t) {
-        const rows = await cloud.teamDrills(t.id);
+        const [rows, ser, ros, hrs] = await Promise.all([
+          cloud.teamDrills(t.id),
+          cloud.teamSeries(t.id),
+          cloud.teamDrivers(t.id),
+          cloud.driverHours(t.id).catch(() => []),
+        ]);
         setTeamLaps(rows.map(drillToLap));
+        setSeries(ser);
+        setRoster(ros);
+        setHours(hrs);
       }
-    } catch { setTeam(null); setTeamLaps([]); }
+    } catch { setTeam(null); setTeamLaps([]); setSeries([]); setRoster([]); setHours([]); }
 
-    setScreen("garage");
+    setLastSeries(remote?.lastSeries ?? store.get(`bt:series:${prof.id}`) ?? null);
+    setScreen("home");
   }, []);
 
   useEffect(() => {
@@ -2009,15 +2049,17 @@ export default function BrakeTrainer() {
     if (patch.bests !== undefined) store.set(`bt:bests:${driver.id}`, patch.bests);
     if (patch.brakeOnly !== undefined) store.set(`bt:brakeOnly:${driver.id}`, patch.brakeOnly);
     if (patch.showNotes !== undefined) store.set(`bt:showNotes:${driver.id}`, patch.showNotes);
+    if (patch.lastSeries !== undefined) store.set(`bt:series:${driver.id}`, patch.lastSeries);
     if (!driver.cloud || !cloud.ready()) return;
     cloud.pushSettings({
       feel: patch.feel ?? feel,
       bests: patch.bests ?? bests,
       brakeOnly: patch.brakeOnly ?? brakeOnly,
       showNotes: patch.showNotes ?? showNotes,
+      lastSeries: patch.lastSeries ?? lastSeries,
       cal: patch.cal ?? cal,
     }).catch(() => setSyncNote("Your settings are saved on this machine but did not reach the server."));
-  }, [driver, feel, bests, brakeOnly, showNotes, cal]);
+  }, [driver, feel, bests, brakeOnly, showNotes, lastSeries, cal]);
 
   const all = useMemo(() => [...LAPS, ...teamLaps, ...imported], [teamLaps, imported]);
   const [nameRev, setNameRev] = useState(0);   // bump to re-read custom names
@@ -2122,7 +2164,24 @@ export default function BrakeTrainer() {
     }
   }, [fullLap?.id, notes]);
 
-  const goHome = useCallback(() => setScreen("garage"), []);
+  const goHome = useCallback(() => setScreen(team ? "home" : "garage"), [team]);
+
+  /* Riki asked to be told when someone wants access. With no email provider
+     wired up that means showing the count wherever he already looks — which
+     is now the landing page as well as the garage, so polling lives here
+     rather than inside one screen. */
+  const [pending, setPending] = useState(0);
+  useEffect(() => {
+    if (account?.role !== "coach" || !cloud.ready()) return;
+    let gone = false;
+    const check = async () => {
+      try { const r = await cloud.pendingRequests(); if (!gone) setPending(r.length); }
+      catch { /* offline; leave the count alone */ }
+    };
+    check();
+    const iv = setInterval(check, 60000);
+    return () => { gone = true; clearInterval(iv); };
+  }, [account?.role]);
 
   const leaveAccount = useCallback(async () => {
     await cloud.signOut();
@@ -2166,8 +2225,28 @@ export default function BrakeTrainer() {
         <Leaderboard lapKey={`${fullLap.id}:${drill.id}`} lapLabel={label} onHome={goHome}
           onBack={() => setScreen("garage")} />
       )}
+      {screen === "home" && (
+        <Home
+          team={team} series={series} drivers={roster} hours={hours}
+          lastSeries={lastSeries}
+          me={{
+            name: driver?.name,
+            userId: account?.id,
+            seriesId: roster.find((d) => d.user_id === account?.id)?.series_id ?? null,
+          }}
+          onPickSeries={(id) => { setLastSeries(id); persist({ lastSeries: id }); }}
+          onEnter={(d, isMe) => { setViewDriver(isMe ? null : d); setScreen("garage"); }}
+          onGarage={() => { setViewDriver(null); setScreen("garage"); }}
+          onBoard={driver?.cloud ? () => setScreen("board") : null}
+          onAccount={driver?.cloud ? () => setScreen("account") : null}
+          onRequests={account?.role === "coach" ? () => setScreen("requests") : null}
+          pending={pending}
+          onSignOut={leaveAccount}
+        />
+      )}
       {screen === "garage" && (
         <Garage
+          viewDriver={viewDriver} pending={pending} onHome={goHome}
           driver={driver} account={account} syncNote={syncNote}
           brakeOnly={brakeOnly} setBrakeOnly={saveBrakeOnly}
           showNotes={showNotes} setShowNotes={saveShowNotes}
@@ -2243,7 +2322,7 @@ export default function BrakeTrainer() {
 
    Cheap on purpose: two-pixel steps, one path, no shadows. Frozen for
    anyone who has asked their system for reduced motion. */
-function TraceStrip() {
+function TraceStrip({ wide = false }) {
   const cvs = useRef(null);
 
   useEffect(() => {
@@ -2325,7 +2404,7 @@ function TraceStrip() {
     return () => { cancelAnimationFrame(raf); ro.disconnect(); };
   }, []);
 
-  return <canvas ref={cvs} className="trace-strip" aria-hidden="true" />;
+  return <canvas ref={cvs} className={`trace-strip ${wide ? "wide" : ""}`} aria-hidden="true" />;
 }
 
 /* ---------------- Sign in ----------------
@@ -3105,15 +3184,151 @@ function Masthead({ onHome = null }) {
   );
 }
 
+/* ---------------- Home ----------------
+   Where a signed-in driver lands. The team, its programmes, and the people in
+   them — and nothing else. Riki's brief was a professional workspace, so the
+   restraint is the point: a mark, a name, the traces, and the list you came
+   to click. No dashboard furniture, no tiles for the sake of tiles.
+
+   Hours come from the runs already logged, so "who is putting the work in"
+   answers itself without anybody filling in a form. */
+function Home({ team, series, drivers, hours, me, lastSeries, onPickSeries,
+                onEnter, onGarage, onBoard, onAccount, onRequests, pending = 0,
+                onSignOut, loading }) {
+  const [sel, setSel] = useState(lastSeries ?? null);
+
+  /* The series a driver chose last time fills itself in, so the common case
+     is one tap on their own name rather than two taps every session. */
+  useEffect(() => {
+    if (sel || !series.length) return;
+    const mine = me?.seriesId && series.find((s) => s.id === me.seriesId);
+    setSel(lastSeries ?? mine?.id ?? (series.length === 1 ? series[0].id : null));
+  }, [series, lastSeries, me, sel]);
+
+  const pick = (id) => { setSel(id); onPickSeries(id); };
+
+  const roster = sel ? drivers.filter((d) => d.series_id === sel) : [];
+  const countFor = (id) => drivers.filter((d) => d.series_id === id).length;
+
+  /* One row per driver out of the per-track rows the server returns. */
+  const totals = useMemo(() => {
+    const out = {};
+    for (const h of hours ?? []) {
+      const t = out[h.driver_id] ?? (out[h.driver_id] = { seconds: 0, runs: 0, best: 0, tracks: 0 });
+      t.seconds += Number(h.seconds) || 0;
+      t.runs += Number(h.runs) || 0;
+      t.tracks += 1;
+      t.best = Math.max(t.best, Number(h.best) || 0);
+    }
+    return out;
+  }, [hours]);
+
+  const spell = (s) => {
+    const secs = Math.round(s || 0);
+    if (secs < 60) return `${secs}s`;
+    const h = Math.floor(secs / 3600), m = Math.round((secs % 3600) / 60);
+    return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
+  };
+
+  return (
+    <div className="home">
+      <div className="home-head">
+        <img src={VCASO_LOGO} alt="VCASO Performance" className="vcaso-logo big" />
+        <h1 className="display-name">Brake Trainer</h1>
+      </div>
+      <TraceStrip wide />
+
+      <div className="home-body">
+        <header className="home-bar">
+          <h2 className="team-name">{team?.name ?? "Your laps"}</h2>
+          <div className="dock-actions">
+            <button className="btn ghost sm" onClick={onGarage}>Garage</button>
+            {onBoard && <button className="btn ghost sm" onClick={onBoard}>Leaderboard</button>}
+            {onRequests && (
+              <button className="btn ghost sm" onClick={onRequests}>
+                Requests{pending > 0 ? ` (${pending})` : ""}
+              </button>
+            )}
+            {onAccount && <button className="btn ghost sm" onClick={onAccount}>Account</button>}
+            <button className="btn ghost sm" onClick={onSignOut}>Sign out</button>
+          </div>
+        </header>
+
+        {!team && (
+          <p className="lede">
+            You are not in a team, so this is yours alone — the reference laps
+            and anything you import. Nothing of anyone else's is visible here.
+          </p>
+        )}
+
+        {team && (
+          <>
+            <div className="series-row">
+              {series.map((s) => (
+                <button key={s.id}
+                  className={`series ${sel === s.id ? "on" : ""} ${countFor(s.id) ? "" : "empty"}`}
+                  onClick={() => pick(s.id)}>
+                  <span className="series-name">{s.name}</span>
+                  <span className="series-n">{countFor(s.id) || "—"}</span>
+                </button>
+              ))}
+            </div>
+
+            {loading && <p className="lede">Loading…</p>}
+
+            {sel && !loading && roster.length === 0 && (
+              <p className="lede">No drivers in this programme yet.</p>
+            )}
+
+            {sel && roster.length > 0 && (
+              <ul className="roster">
+                {roster.map((d) => {
+                  const t = totals[d.id];
+                  const isMe = me?.userId && d.user_id === me.userId;
+                  return (
+                    <li key={d.id}>
+                      <button className={`driver ${isMe ? "me" : ""}`}
+                        onClick={() => onEnter(d, isMe)}>
+                        <span className="driver-no num">{d.car_no || "—"}</span>
+                        <span className="driver-name">
+                          {d.full_name}{isMe && <span className="tag">you</span>}
+                        </span>
+                        <span className="driver-stat num">
+                          {t ? spell(t.seconds) : "—"}
+                        </span>
+                        <span className="driver-stat dim num">
+                          {t ? `${t.runs} run${t.runs === 1 ? "" : "s"}` : "no runs yet"}
+                        </span>
+                        <span className="driver-best num">{t?.best ? Math.round(t.best) : ""}</span>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+
+            {sel && roster.length > 0 && (
+              <p className="fine">
+                Time at the wheel and runs logged, from every session recorded here.
+                Tap your own name to drive; tap anyone else to see what they have done.
+              </p>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ---------------- Garage ---------------- */
 function Garage({
   driver, account, syncNote, onSwitchDriver, cat, setCat, all, lapId, setLapId, fullLap,
   drills, drillId, setDrillId, lap, cal, keyboard, setKeyboard, best, onImport, lapWarn,
   onDeleteLap, brakeOnly, setBrakeOnly, showNotes, setShowNotes, notes, onSaveNote,
-  isCoach, team, onShareWithTeam, onRemoveFromTeam, onCalibrate, onFeel, onLogbook,
-  onRenameZone, onAccount, onRequests, onBoard, onStart,
+  isCoach, team, onShareWithTeam, onRemoveFromTeam, viewDriver, pending = 0,
+  onHome, onCalibrate, onFeel, onLogbook, onRenameZone, onAccount, onRequests,
+  onBoard, onStart,
 }) {
-  const [pending, setPending] = useState(0);
   const [sharing, setSharing] = useState(null);   // the lap being named for the team
   const [shareName, setShareName] = useState("");
   const [shareNote, setShareNote] = useState("");
@@ -3134,21 +3349,6 @@ function Garage({
     window.addEventListener("gamepadconnected", scan);
     return () => { clearInterval(iv); window.removeEventListener("gamepadconnected", scan); };
   }, []);
-
-  /* Riki asked to be told when someone requests access. Without an email
-     provider wired up that means showing him the count wherever he already
-     looks, so the garage carries it and refreshes while the page is open. */
-  useEffect(() => {
-    if (account?.role !== "coach" || !cloud.ready()) return;
-    let gone = false;
-    const check = async () => {
-      try { const r = await cloud.pendingRequests(); if (!gone) setPending(r.length); }
-      catch { /* offline, leave the count alone */ }
-    };
-    check();
-    const iv = setInterval(check, 60000);
-    return () => { gone = true; clearInterval(iv); };
-  }, [account?.role]);
 
   const mapped = calMapped(cal);
   const missing = mapped ? calMissing(cal, pads) : [];
@@ -3178,7 +3378,7 @@ function Garage({
 
   return (
     <div className="garage">
-      <Masthead />
+      <Masthead onHome={team ? onHome : null} />
       <header className="top">
         <span className="wordmark sm">Brake Trainer</span>
         <div className="dock-actions">
@@ -3196,6 +3396,13 @@ function Garage({
         </div>
       </header>
       {syncNote && <p className="err">{syncNote}</p>}
+      {viewDriver && (
+        <p className="viewing">
+          Looking at <strong>{viewDriver.full_name}</strong>'s record. A session always
+          records against whoever is signed in, so driving from here is off — go back
+          and pick your own name.
+        </p>
+      )}
 
       <div className="cats">
         {cats.map((c) => {
@@ -3426,7 +3633,9 @@ function Garage({
           <button className="btn ghost" onClick={onLogbook}>Logbook</button>
           <button className="btn ghost" disabled={!linked && !keyboard} onClick={onFeel}>Feel</button>
           <button className="btn ghost" onClick={onCalibrate}>{linked ? "Recalibrate" : "Link pedals"}</button>
-          <button className="btn primary" disabled={!ready} onClick={onStart}>Run session</button>
+          <button className="btn primary" disabled={!ready || !!viewDriver} onClick={onStart}>
+            {viewDriver ? "Not your session" : "Run session"}
+          </button>
         </div>
       </footer>
     </div>
@@ -4757,6 +4966,56 @@ header.top{display:flex; align-items:center; justify-content:space-between; gap:
 @media (max-width:760px){
   .run-note{flex-direction:column; gap:4px; margin:0 16px 8px; padding:10px 14px;}
   .run-note-body{font-size:15px;}
+}
+
+.viewing{border:1px solid var(--line); border-left:2px solid var(--warn); border-radius:0 12px 12px 0;
+  background:var(--panel); color:var(--dim); font-size:13.5px; line-height:1.5;
+  padding:11px 16px; margin:0 0 16px; max-width:70ch;}
+.viewing strong{color:var(--text); font-weight:600;}
+
+/* home */
+.home{min-height:100vh; display:flex; flex-direction:column;}
+.home-head{padding:34px 26px 0; display:flex; flex-direction:column; align-items:center;}
+.home-head .vcaso-logo.big{margin-bottom:16px;}
+.home-head .display-name{margin-bottom:18px;}
+.trace-strip.wide{height:92px; margin:0 0 30px;
+  -webkit-mask-image:linear-gradient(90deg,transparent,#000 8%,#000 92%,transparent);
+  mask-image:linear-gradient(90deg,transparent,#000 8%,#000 92%,transparent);}
+.home-body{flex:1; width:100%; max-width:860px; margin:0 auto; padding:0 26px 48px;}
+.home-bar{display:flex; align-items:center; justify-content:space-between; gap:16px;
+  flex-wrap:wrap; row-gap:12px; padding-bottom:18px; margin-bottom:26px;
+  border-bottom:1px solid var(--line);}
+.team-name{font-family:"Michroma","Eurostile",ui-sans-serif,system-ui,sans-serif;
+  font-size:15px; font-weight:400; letter-spacing:.12em; text-transform:uppercase; margin:0;}
+
+.series-row{display:flex; flex-wrap:wrap; gap:8px; margin-bottom:28px;}
+.series{display:flex; align-items:baseline; gap:9px; background:transparent;
+  border:1px solid var(--line); color:var(--dim); padding:9px 18px; border-radius:999px;
+  font:inherit; font-size:14px; cursor:pointer; transition:border-color .12s, color .12s;}
+.series:hover{border-color:#3d4442; color:var(--text);}
+.series.on{border-color:var(--ui); color:var(--ui); background:rgba(255,255,255,0.06);}
+.series.empty{opacity:.45;}
+.series-n{font-size:11.5px; color:var(--dimmer); font-variant-numeric:tabular-nums;}
+.series.on .series-n{color:var(--ui);}
+
+.roster{list-style:none; margin:0 0 14px; padding:0; display:flex; flex-direction:column; gap:3px;}
+.driver{width:100%; display:grid; grid-template-columns:44px 1fr auto auto 44px;
+  align-items:baseline; gap:16px; text-align:left; background:var(--panel);
+  border:1px solid transparent; border-left:2px solid var(--line); color:var(--text);
+  padding:14px 18px; border-radius:0 12px 12px 0; cursor:pointer; font:inherit;
+  transition:border-color .12s, background .12s;}
+.driver:hover{background:var(--panel2); border-left-color:var(--dim);}
+.driver.me{border-left-color:var(--ui);}
+.driver-no{font-size:12.5px; color:var(--dimmer);}
+.driver-name{font-size:15.5px;}
+.driver-stat{font-size:13px; color:var(--dim); white-space:nowrap;}
+.driver-best{font-size:15px; text-align:right;}
+
+@media (max-width:680px){
+  .home-head{padding-top:24px;}
+  .trace-strip.wide{height:70px; margin-bottom:22px;}
+  .driver{grid-template-columns:38px 1fr auto; row-gap:4px; padding:12px 14px;}
+  .driver-best{display:none;}
 }
 
 /* accounts, requests and the board */
