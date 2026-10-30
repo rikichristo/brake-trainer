@@ -69,3 +69,75 @@ only. Approving from a claude.ai artifact preview will fail — deliberately.
 - **Leaked password protection is off.** Worth switching on in the Supabase
   dashboard under Authentication, so a driver cannot set a password that is in
   a known breach list. Cannot be changed from the MCP tools.
+
+---
+
+# The shared team layer (`vp_*`)
+
+Added 30 October 2026, when the trainer stopped being "Riki and his drivers"
+and started being a platform that could be sold to teams.
+
+## Why it exists
+
+Rodin's structure — series, drivers, engineers, events — already existed and
+was live under `rh_*`. But those names bake one customer into the schema, and
+the whole point is to sell this to other teams. So the structure now lives in
+neutral `vp_*` tables (VCASO Platform) where **Rodin is simply the first row in
+`vp_teams`**.
+
+**Nothing in `rh_*` was touched.** The Hub is live and another session is
+actively building in it — six new tables appeared in two days. Moving the Hub
+onto this layer is a separate job that needs coordinating with whoever is
+working there, not something to do underneath a running app. Until then Rodin's
+roster exists in both places, seeded from the Hub, and will drift if either
+side is edited. That is a known cost of not stopping the Hub.
+
+## Shape
+
+```
+vp_teams ─┬─ vp_members        (user → team, role: owner|coach|engineer|driver)
+          ├─ vp_drivers        (a person in a team; user_id null until they have a login)
+          ├─ vp_engineer_drivers
+          ├─ vp_series ── vp_seasons ── vp_events ── vp_objectives
+          └─ vp_drills         (the team's named drill library)
+```
+
+**Every table carries `team_id`**, including ones that could reach a team
+through a join. Deliberate denormalisation: it makes every security check the
+same single comparison instead of a chain of lookups.
+
+**A driver is separate from an account** (`vp_drivers.user_id` is nullable).
+That is what lets an engineer add data for a driver who has never signed in.
+
+**`vp_drills` is the "Potato Brake Shape" library** — real telemetry an
+engineer uploads once, named, usable by every driver in the team. Channels are
+packed exactly as the built-in reference laps are, so the trainer can run one
+without knowing where it came from.
+
+## Who can do what
+
+Riki's rule is that **everyone inside a team sees everything their team has**,
+so reading is one comparison and all the restriction is on writing:
+
+| | read | add data | manage the team |
+|---|---|---|---|
+| owner | ✓ | ✓ | ✓ |
+| coach | ✓ | ✓ | ✓ |
+| engineer | ✓ | ✓ | — |
+| driver | ✓ | — | — |
+| non-member | — | — | — |
+
+`vp_can_write` is the first three; `vp_is_admin` the first two.
+
+## Verify after any policy change
+
+`supabase/checks/vp_permissions.sql` impersonates a real engineer, a real
+driver and a complete outsider. Run it after touching any `vp_*` policy.
+
+Reading a policy and believing it is not the same as testing it. The `bt_*`
+tables shipped once with correct policies and no table grants, and once with a
+policy that let a driver promote themselves to coach. Both were caught here,
+not by review.
+
+The boundary that matters commercially is the last two rows of that check: a
+valid login with no membership must see zero drivers and zero drills.
